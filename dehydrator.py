@@ -271,6 +271,8 @@ class Dehydrator:
         self.thinking_mode = self._normalize_thinking_mode(dehy_cfg.get("thinking_mode", ""))
         self.max_tokens = dehy_cfg.get("max_tokens", 1024)
         self.temperature = dehy_cfg.get("temperature", 0.1)
+        self.timeout_seconds = max(1.0, float(dehy_cfg.get("timeout_seconds", 60.0)))
+        self.max_retries = max(0, int(dehy_cfg.get("max_retries", 2)))
 
         # --- API availability / 是否有可用的 API ---
         self.api_available = bool(self.api_key)
@@ -281,7 +283,8 @@ class Dehydrator:
             self.client = AsyncOpenAI(
                 api_key=self.api_key,
                 base_url=self.base_url,
-                timeout=60.0,
+                timeout=self.timeout_seconds,
+                max_retries=self.max_retries,
             )
         else:
             self.client = None

@@ -51,7 +51,7 @@ import json as _json_lib
 import re
 import secrets
 import time
-from base64 import b64decode
+from base64 import b64decode, urlsafe_b64encode
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlencode, urlparse
@@ -590,7 +590,7 @@ class ChatGptOAuthProvider:
             if uri.strip()
         )
         self.token_ttl_seconds = token_ttl_seconds
-        self._codes: dict[str, tuple[str, float]] = {}
+        self._codes: dict[str, tuple[str, float, str, str]] = {}
 
     @property
     def enabled(self) -> bool:
@@ -623,22 +623,44 @@ class ChatGptOAuthProvider:
             or redirect_uri in self.redirect_uris
         )
 
-    def create_authorization_code(self, redirect_uri: str) -> str:
+    def create_authorization_code(
+        self,
+        redirect_uri: str,
+        code_challenge: str = "",
+        code_challenge_method: str = "",
+    ) -> str:
         code = secrets.token_urlsafe(32)
-        self._codes[code] = (redirect_uri, time.time() + 300)
+        self._codes[code] = (
+            redirect_uri,
+            time.time() + 300,
+            code_challenge.strip(),
+            code_challenge_method.strip().upper(),
+        )
         return code
 
-    def consume_authorization_code(self, code: str | None, redirect_uri: str | None) -> bool:
+    def consume_authorization_code(
+        self,
+        code: str | None,
+        redirect_uri: str | None,
+        code_verifier: str | None = None,
+    ) -> bool:
         if not code:
             return False
         entry = self._codes.pop(code, None)
         if not entry:
             return False
-        stored_redirect_uri, expires_at = entry
+        stored_redirect_uri, expires_at, code_challenge, code_challenge_method = entry
         if time.time() > expires_at:
             return False
         if redirect_uri and redirect_uri != stored_redirect_uri:
             return False
+        if code_challenge:
+            if code_challenge_method != "S256" or not code_verifier:
+                return False
+            digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
+            expected = urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+            if not hmac.compare_digest(expected, code_challenge):
+                return False
         return True
 
     def valid_access_token(self, token: str | None) -> bool:
@@ -859,7 +881,15 @@ async def chatgpt_oauth_authorize(request):
     if not OMBRE_CHATGPT_OAUTH.valid_redirect_uri(redirect_uri):
         return _oauth_error("invalid_redirect_uri")
 
-    code = OMBRE_CHATGPT_OAUTH.create_authorization_code(redirect_uri)
+    code_challenge = params.get("code_challenge", "")
+    code_challenge_method = params.get("code_challenge_method", "")
+    if code_challenge and code_challenge_method.upper() != "S256":
+        return _oauth_error("invalid_request")
+    code = OMBRE_CHATGPT_OAUTH.create_authorization_code(
+        redirect_uri,
+        code_challenge=code_challenge,
+        code_challenge_method=code_challenge_method,
+    )
     query = {"code": code}
     if state:
         query["state"] = state
@@ -885,7 +915,11 @@ async def chatgpt_oauth_token(request):
 
     grant_type = form.get("grant_type")
     if grant_type == "authorization_code":
-        if not OMBRE_CHATGPT_OAUTH.consume_authorization_code(form.get("code"), form.get("redirect_uri")):
+        if not OMBRE_CHATGPT_OAUTH.consume_authorization_code(
+            form.get("code"),
+            form.get("redirect_uri"),
+            form.get("code_verifier"),
+        ):
             return _oauth_error("invalid_grant")
     elif grant_type == "refresh_token":
         if not OMBRE_CHATGPT_OAUTH.valid_refresh_token(form.get("refresh_token")):
@@ -906,6 +940,8 @@ def _oauth_server_metadata(request) -> dict:
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code", "refresh_token"],
         "token_endpoint_auth_methods_supported": OMBRE_CHATGPT_OAUTH.token_auth_methods,
+        "code_challenge_methods_supported": ["S256"],
+        "scopes_supported": ["offline_access"],
     }
 
 
