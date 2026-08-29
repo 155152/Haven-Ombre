@@ -39,6 +39,7 @@ from typing import Optional
 import frontmatter
 import jieba
 
+from bucket_revisions import BucketRevisionStore
 from identity import identity_names
 from memory_relevance import content_terms_for_query, memory_relevance_options_from_config, recall_topic_query
 from query_terms import GENERIC_LEXICAL_STOPWORDS
@@ -75,6 +76,7 @@ class BucketManager:
         self.tombstone_dir = os.path.join(self.base_dir, ".tombstones")
         self.fuzzy_threshold = config.get("matching", {}).get("fuzzy_threshold", 50)
         self.max_results = config.get("matching", {}).get("max_results", 5)
+        self.revision_store = BucketRevisionStore(config)
 
         # --- Wikilink config / 双链配置 ---
         wikilink_cfg = config.get("wikilink", {})
@@ -306,8 +308,16 @@ class BucketManager:
         if is_pinned:
             kwargs.pop("importance", None)  # silently ignore importance update
 
+        revision_reason = str(kwargs.pop("revision_reason", "") or "bucket_update")
+
         # --- Update only fields that were passed in / 只改传入的字段 ---
         if "content" in kwargs:
+            self.revision_store.preserve_before_replace(
+                bucket_id,
+                post.content,
+                kwargs["content"],
+                reason=revision_reason,
+            )
             post.content = kwargs["content"]  # wikilink injection disabled; LLM adds [[]] via prompt
         if "tags" in kwargs:
             post["tags"] = kwargs["tags"]
@@ -1388,10 +1398,13 @@ class BucketManager:
             os.makedirs(target_dir, exist_ok=True)
             dest = safe_path(target_dir, os.path.basename(file_path))
 
-            post["type"] = "dynamic"
-            post["active"] = True
-            post["deprecated"] = False
-            post["resolved"] = False
+            tags = post.get("tags", []) if isinstance(post.get("tags", []), list) else []
+            is_source_record = post.get("type") == "source" or "source_record" in {str(tag) for tag in tags}
+            post["type"] = "source" if is_source_record else "dynamic"
+            if not is_source_record:
+                post["active"] = True
+                post["deprecated"] = False
+                post["resolved"] = False
             post["updated_at"] = now_iso()
             post["last_active"] = post.get("last_active") or post["updated_at"]
             with open(file_path, "w", encoding="utf-8") as f:

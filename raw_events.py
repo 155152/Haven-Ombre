@@ -244,6 +244,7 @@ class RawEventStore:
         start_at: datetime,
         end_at: datetime,
         limit: int = 40,
+        offset: int = 0,
         source: str = "",
         conversation_id: str = "",
         session_id: str = "",
@@ -253,6 +254,11 @@ class RawEventStore:
         except (TypeError, ValueError):
             raw_limit = 40
         safe_limit = max(0, min(10000, raw_limit))
+        try:
+            raw_offset = int(offset)
+        except (TypeError, ValueError):
+            raw_offset = 0
+        safe_offset = max(0, min(1_000_000, raw_offset))
         filters, params = self._search_filters(
             source=source,
             conversation_id=conversation_id,
@@ -306,11 +312,16 @@ class RawEventStore:
         conn.close()
 
         selected: list[dict[str, Any]] = []
+        matched = 0
         for row in rows:
             created = parse_local(row["created_at"])
             if created is None or not (start <= created < end):
                 continue
+            if matched < safe_offset:
+                matched += 1
+                continue
             selected.append(self._row_to_event(row))
+            matched += 1
             if safe_limit > 0 and len(selected) >= safe_limit:
                 break
         return selected

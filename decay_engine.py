@@ -26,6 +26,9 @@ from datetime import datetime, timezone
 
 logger = logging.getLogger("ombre_brain.decay")
 
+DECAY_EXEMPT_SOURCE_TYPES = frozenset({"source", "raw", "chat_log", "diary_source"})
+DECAY_EXEMPT_SOURCE_TAGS = frozenset({"source_record", "raw_source", "chat_log", "diary_source"})
+
 
 class DecayEngine:
     """
@@ -95,6 +98,21 @@ class DecayEngine:
     def _now_naive_utc() -> datetime:
         return datetime.now(timezone.utc).replace(tzinfo=None)
 
+    @staticmethod
+    def _is_source_evidence(metadata: dict) -> bool:
+        """Source/evidence buckets are archival evidence, not vividness-ranked memories."""
+        if not isinstance(metadata, dict):
+            return False
+        bucket_type = str(metadata.get("type") or metadata.get("bucket_type") or "").strip().lower()
+        raw_tags = metadata.get("tags", [])
+        if isinstance(raw_tags, str):
+            tags = {item.strip().lower() for item in raw_tags.split(",") if item.strip()}
+        elif isinstance(raw_tags, (list, tuple, set)):
+            tags = {str(item or "").strip().lower() for item in raw_tags if str(item or "").strip()}
+        else:
+            tags = set()
+        return bucket_type in DECAY_EXEMPT_SOURCE_TYPES or bool(tags & DECAY_EXEMPT_SOURCE_TAGS)
+
     def calculate_score(self, metadata: dict) -> float:
         """
         Calculate current activity score for a memory bucket.
@@ -121,6 +139,10 @@ class DecayEngine:
         # --- Feel buckets: never decay, fixed moderate score ---
         if metadata.get("type") == "feel":
             return 50.0
+
+        # --- Source/evidence buckets are provenance storage, not vividness-ranked memories. ---
+        if self._is_source_evidence(metadata):
+            return 999.0
 
         importance = max(1, min(10, int(metadata.get("importance", 5))))
         activation_count = max(1, int(metadata.get("activation_count", 1)))
@@ -206,9 +228,15 @@ class DecayEngine:
         for bucket in buckets:
             meta = bucket.get("metadata", {})
 
-            # Skip permanent / pinned / protected / feel buckets
-            # 跳过固化桶、钉选/保护桶和 feel 桶
-            if meta.get("type") in ("permanent", "feel") or meta.get("pinned") or meta.get("protected"):
+            # Skip permanent / pinned / protected / feel / source-evidence buckets.
+            # Source records preserve provenance and must not disappear because their event time is old.
+            # 跳过固化桶、钉选/保护桶、feel 桶和证据源桶；证据层不参与普通记忆鲜活度衰减。
+            if (
+                meta.get("type") in ("permanent", "feel")
+                or meta.get("pinned")
+                or meta.get("protected")
+                or self._is_source_evidence(meta)
+            ):
                 continue
 
             checked += 1

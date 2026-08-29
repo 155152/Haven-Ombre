@@ -12,6 +12,7 @@ from openai import AsyncOpenAI
 
 from identity import generic_identity_names, identity_names, render_identity_template
 from memory_edges import RELATION_TYPES, MemoryEdgeStore
+from memory_layers import LAYER_SOURCE_RECORD, infer_bucket_layer
 from memory_metadata import domain_prompt_options_text, normalize_domain_key
 from persona_event_selection import select_persona_events
 from self_anchor import is_self_anchor_bucket
@@ -189,14 +190,37 @@ DAILY_CHAT_MEMORY_PROMPT_TEMPLATE = """这是 {user_display_name} 和 {ai_name} 
       "kind": "key_event",
       "title": "短标题",
       "content": "长期记忆候选",
-      "source_event_ids": [101, 102],
-      "source_turn_ids": [1, 2]
+      "confidence": 0.72
     }
   ]
 }
 
 kind 可用 key_event / stable_preference / boundary / signal / commitment / project_state / relationship_anchor。
+每条候选必须给 confidence，范围 0 到 1，表示材料对这条长期记忆的直接支持程度：明确说过/确认过的事实、边界、偏好、约定可给较高值；只靠气氛、推测或临时上下文的内容应低于 0.55。
+这一阶段只负责抽候选，不要输出 source_turn_ids / source_event_ids；Ombre 会在下一步单独做 provenance 对齐。
+保持 JSON 紧凑，不要输出解释文字或 Markdown。
 没有候选时返回 {"candidates": []}。"""
+
+
+DAILY_CHAT_MEMORY_PROVENANCE_PROMPT_TEMPLATE = """你是 Ombre 的 provenance 对齐器。
+输入包含 candidate_memories 和带 turn_ref 的 conversation_turns。你的唯一任务是为每条候选找出最直接支撑它的 1 到 4 个 turn_ref。
+
+规则：
+- 不要改写候选，不要新增或删除候选，不要评价重要性。
+- source_turn_refs 只能复制 conversation_turns 里真实存在的 `turn_ref` 数字。
+- turn_ref 只是这次对齐调用里的临时编号；真正的 turn id / raw event id 会由 Ombre 代码映射，禁止你自己生成 provenance id。
+- 只选直接支撑该候选的 turns，不要因为在同一窗口就把整段都挂上。
+- 如果某条候选找不到直接证据，给空数组；后续系统会 fail-closed，不写这条候选。
+- 只输出紧凑 JSON，不要 Markdown 或解释。
+
+输出：
+{
+  "alignments": [
+    {"candidate_index": 0, "source_turn_refs": [17, 18]},
+    {"candidate_index": 1, "source_turn_refs": [15]}
+  ]
+}
+"""
 
 
 DAILY_CHAT_MEMORY_SUMMARY_PROMPT_TEMPLATE = """你是 {ai_name} 的对话压缩器。你正在为 Ombre 自动记忆做第一步：把一段连续聊天压缩成“候选抽取材料”，不是直接写长期记忆。
@@ -484,11 +508,17 @@ class ReflectionEngine:
                 timeout=self.daily_chat_memory_timeout_seconds,
             )
         self.dehydration_client = None
+        self.daily_chat_memory_dehydration_client = None
         if self.enabled and self.dehydration_api_key and self.dehydration_base_url and self.dehydration_model:
             self.dehydration_client = AsyncOpenAI(
                 api_key=self.dehydration_api_key,
                 base_url=self.dehydration_base_url,
                 timeout=45.0,
+            )
+            self.daily_chat_memory_dehydration_client = AsyncOpenAI(
+                api_key=self.dehydration_api_key,
+                base_url=self.dehydration_base_url,
+                timeout=self.daily_chat_memory_timeout_seconds,
             )
         self.daily_activity_summary_dehydration_client = self.dehydration_client
 
@@ -595,6 +625,8 @@ class ReflectionEngine:
         meta = bucket.get("metadata", {})
         if meta.get("type") == "feel":
             return {"status": "skipped_feel", "id": bucket_id}
+        if infer_bucket_layer(bucket) == LAYER_SOURCE_RECORD:
+            return {"status": "skipped_source_record", "id": bucket_id}
 
         candidates = await self._candidate_buckets(bucket, bucket_mgr, embedding_engine)
         if self.client:
@@ -660,7 +692,7 @@ class ReflectionEngine:
         if not bucket:
             return {"status": "missing", "id": bucket_id, "edges": 0, "proposed_edges": 0}
         meta = bucket.get("metadata", {})
-        if meta.get("type") == "feel" or meta.get("protected"):
+        if meta.get("type") == "feel" or meta.get("protected") or infer_bucket_layer(bucket) == LAYER_SOURCE_RECORD:
             return {"status": "skipped", "reason": "not_edge_backfillable", "id": bucket_id, "edges": 0, "proposed_edges": 0}
 
         candidates = await self._candidate_buckets(bucket, bucket_mgr, embedding_engine)
@@ -1742,7 +1774,7 @@ class ReflectionEngine:
             client = self.daily_chat_memory_client
             model = self.daily_chat_memory_candidate_model if candidate else self.daily_chat_memory_summary_model
             return client, str(model or "").strip(), True
-        dehy_client = self._daily_dehydration_client()
+        dehy_client = self.daily_chat_memory_dehydration_client or self._daily_dehydration_client()
         if dehy_client and self.dehydration_model:
             return dehy_client, str(self.dehydration_model or "").strip(), False
         if self.client:
@@ -2283,6 +2315,7 @@ class ReflectionEngine:
         key: str = "",
         mode: str = "",
         force: bool = False,
+        raw_event_offset: int = 0,
         now: datetime | None = None,
     ) -> dict:
         effective_mode = self._normalize_daily_chat_memory_mode(mode or self.daily_chat_memory_mode)
@@ -2302,11 +2335,14 @@ class ReflectionEngine:
         raw_events_cursor_exhausted = False
         if raw_event_store:
             try:
-                raw_events = raw_event_store.list_events_between(
-                    start_at=start,
-                    end_at=end,
-                    limit=self.daily_chat_memory_turn_limit,
-                )
+                raw_event_kwargs = {
+                    "start_at": start,
+                    "end_at": end,
+                    "limit": self.daily_chat_memory_turn_limit,
+                }
+                if int(raw_event_offset or 0) > 0:
+                    raw_event_kwargs["offset"] = max(0, int(raw_event_offset))
+                raw_events = raw_event_store.list_events_between(**raw_event_kwargs)
             except Exception as exc:
                 logger.warning("Daily chat memory raw event read failed: %s", exc)
                 raw_events = []
@@ -2379,12 +2415,19 @@ class ReflectionEngine:
             window_summaries=window_summaries,
             max_candidates=max_candidates,
         )
+        if effective_mode == "review" and raw_candidates:
+            raw_candidates = await self._align_daily_chat_memory_candidate_sources(
+                key,
+                raw_candidates,
+                turns,
+            )
         candidates = self._normalize_daily_chat_memory_candidates(
             key,
             raw_candidates,
             turns,
             max_candidates=max_candidates,
             min_confidence=min_confidence,
+            require_source_provenance=effective_mode == "review",
         )
         if not candidates:
             return {
@@ -2632,6 +2675,110 @@ class ReflectionEngine:
         except Exception as exc:
             logger.warning("Daily chat memory extraction failed; skipping write: %s", exc)
         return []
+
+    async def _align_daily_chat_memory_candidate_sources(
+        self,
+        key: str,
+        candidates: list[dict],
+        turns: list[dict],
+    ) -> list[dict]:
+        if not candidates or not turns:
+            return candidates
+        client, model, use_daily_client = self._daily_chat_memory_model_client(candidate=True)
+        if not client:
+            logger.warning("Daily chat memory provenance alignment skipped: model unavailable")
+            return candidates
+
+        compact_candidates = [
+            {
+                "candidate_index": index,
+                "kind": str(candidate.get("kind") or ""),
+                "title": str(candidate.get("title") or "")[:80],
+                "content": str(candidate.get("content") or "")[:600],
+            }
+            for index, candidate in enumerate(candidates)
+        ]
+        turns_by_ref: dict[int, dict] = {}
+        compact_turns = []
+        for turn_ref, turn in enumerate(turns, start=1):
+            turns_by_ref[turn_ref] = turn
+            compact_turns.append(
+                {
+                    "turn_ref": turn_ref,
+                    "user_text": str(turn.get("user_text") or "")[:700],
+                    "assistant_text": str(turn.get("assistant_text") or "")[:700],
+                }
+            )
+        payload = {
+            "date": key,
+            "candidate_memories": compact_candidates,
+            "conversation_turns": compact_turns,
+        }
+        try:
+            response = await self._daily_chat_memory_create_completion(
+                client,
+                model=model,
+                messages=[
+                    {"role": "system", "content": DAILY_CHAT_MEMORY_PROVENANCE_PROMPT_TEMPLATE},
+                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                ],
+                max_tokens=min(900, self.daily_chat_memory_candidate_max_tokens),
+                temperature=0.0,
+                use_daily_client=use_daily_client,
+            )
+            parsed = self._parse_json_object(self._completion_content(response) or "")
+            alignments = parsed.get("alignments") if isinstance(parsed, dict) else []
+        except Exception as exc:
+            logger.warning("Daily chat memory provenance alignment failed: %s", exc)
+            return candidates
+        if not isinstance(alignments, list):
+            logger.warning("Daily chat memory provenance alignment invalid payload")
+            return candidates
+
+        allowed_turn_refs = set(turns_by_ref)
+        aligned = [dict(candidate) for candidate in candidates]
+        aligned_count = 0
+        for item in alignments:
+            if not isinstance(item, dict):
+                continue
+            try:
+                index = int(item.get("candidate_index"))
+            except (TypeError, ValueError):
+                continue
+            if index < 0 or index >= len(aligned):
+                continue
+            turn_refs = list(dict.fromkeys(
+                int(turn_ref)
+                for turn_ref in self._string_list(item.get("source_turn_refs"), limit=4)
+                if str(turn_ref).isdigit() and int(turn_ref) in allowed_turn_refs
+            ))[:4]
+            if not turn_refs:
+                continue
+            matched_turns = [turns_by_ref[turn_ref] for turn_ref in turn_refs]
+            source_turn_ids = list(dict.fromkeys(
+                int(turn.get("id"))
+                for turn in matched_turns
+                if turn.get("id") is not None and str(turn.get("id")).isdigit()
+            ))[:4]
+            source_event_ids = list(dict.fromkeys(
+                int(event_id)
+                for turn in matched_turns
+                for event_id in (turn.get("raw_event_ids") or [])
+                if event_id is not None and str(event_id).isdigit()
+            ))[:80]
+            if not source_turn_ids and not source_event_ids:
+                continue
+            if source_turn_ids:
+                aligned[index]["source_turn_ids"] = source_turn_ids
+            if source_event_ids:
+                aligned[index]["source_event_ids"] = source_event_ids
+            aligned_count += 1
+        logger.info(
+            "Daily chat memory provenance alignment: candidates=%d aligned=%d",
+            len(candidates),
+            aligned_count,
+        )
+        return aligned
 
     @staticmethod
     def _daily_chat_memory_noise(content: str) -> bool:
@@ -3101,23 +3248,49 @@ class ReflectionEngine:
         *,
         max_candidates: int | None = None,
         min_confidence: float | None = None,
+        require_source_provenance: bool = False,
     ) -> list[dict]:
-        fallback_turn_ids = [turn.get("id") for turn in turns if turn.get("id") is not None]
+        fallback_turn_ids = [
+            int(turn.get("id"))
+            for turn in turns
+            if turn.get("id") is not None and str(turn.get("id")).isdigit()
+        ]
         fallback_raw_event_ids = [
-            event_id
+            int(event_id)
             for turn in turns
             for event_id in (turn.get("raw_event_ids") or [])
-            if event_id is not None
+            if event_id is not None and str(event_id).isdigit()
         ]
+        allowed_turn_ids = set(fallback_turn_ids)
+        allowed_raw_event_ids = set(fallback_raw_event_ids)
+        raw_event_ids_by_turn = {
+            int(turn.get("id")): [
+                int(event_id)
+                for event_id in (turn.get("raw_event_ids") or [])
+                if event_id is not None
+                and str(event_id).isdigit()
+                and int(event_id) in allowed_raw_event_ids
+            ]
+            for turn in turns
+            if turn.get("id") is not None and str(turn.get("id")).isdigit()
+        }
         normalized = []
+        drop_counts: dict[str, int] = {}
+
+        def drop(reason: str) -> None:
+            drop_counts[reason] = drop_counts.get(reason, 0) + 1
+
         for candidate in candidates or []:
             if candidate.get("should_write") is False:
+                drop("should_write_false")
                 continue
             candidate_tags = self._string_list(candidate.get("tags"), limit=8)
             content = self._trim_daily_chat_memory_content(str(candidate.get("content") or "").strip())
             if not content:
+                drop("missing_content")
                 continue
             if self._daily_chat_memory_noise(content):
+                drop("noise")
                 continue
             kind = self._normalize_auto_memory_kind(
                 candidate.get("kind"),
@@ -3125,29 +3298,49 @@ class ReflectionEngine:
                 tags=candidate_tags,
             )
             if not kind or kind == "love_letter":
+                drop("unsupported_kind")
                 continue
             if self._daily_chat_memory_low_value_social_noise(content, kind):
+                drop("low_value_social")
                 continue
             title = str(candidate.get("title") or "").strip()
             if self._daily_chat_memory_low_value_episode(content, kind, title):
+                drop("low_value_episode")
                 continue
             confidence = self._clamp(candidate.get("confidence", 0.0))
             threshold = self.daily_chat_memory_min_confidence if min_confidence is None else min_confidence
             if confidence < threshold:
+                drop("low_confidence")
                 continue
             if self._daily_chat_memory_title_is_generic(title):
                 title = self._daily_chat_memory_title(content, kind, key)
             domain = self._auto_memory_domain(kind, content, candidate_tags, candidate.get("domain"))
-            source_turn_ids = [
+            requested_turn_ids = list(dict.fromkeys(
                 int(turn_id)
                 for turn_id in self._string_list(candidate.get("source_turn_ids"), limit=20)
-                if str(turn_id).isdigit()
-            ] or [int(turn_id) for turn_id in fallback_turn_ids[:20] if str(turn_id).isdigit()]
-            source_event_ids = [
+                if str(turn_id).isdigit() and int(turn_id) in allowed_turn_ids
+            ))
+            requested_event_ids = list(dict.fromkeys(
                 int(event_id)
                 for event_id in self._string_list(candidate.get("source_event_ids"), limit=80)
-                if str(event_id).isdigit()
-            ] or [int(event_id) for event_id in fallback_raw_event_ids[:80] if str(event_id).isdigit()]
+                if str(event_id).isdigit() and int(event_id) in allowed_raw_event_ids
+            ))
+            if require_source_provenance and not requested_turn_ids and not requested_event_ids:
+                drop("missing_source_provenance")
+                continue
+            if requested_turn_ids:
+                source_turn_ids = requested_turn_ids
+                source_event_ids = list(dict.fromkeys(
+                    event_id
+                    for turn_id in requested_turn_ids
+                    for event_id in raw_event_ids_by_turn.get(turn_id, [])
+                ))[:80]
+            elif requested_event_ids:
+                source_turn_ids = []
+                source_event_ids = requested_event_ids
+            else:
+                source_turn_ids = fallback_turn_ids[:20]
+                source_event_ids = fallback_raw_event_ids[:80]
             item = self._daily_chat_memory_enrich_candidate_terms({
                 "id": self._daily_chat_memory_candidate_id(key, kind, content),
                 "date": key,
@@ -3166,10 +3359,17 @@ class ReflectionEngine:
                 "reason": str(candidate.get("reason") or "").strip()[:160],
             })
             if self._daily_chat_memory_duplicate_candidate(item, normalized):
+                drop("duplicate")
                 continue
             normalized.append(item)
             if len(normalized) >= int(max_candidates or self.daily_chat_memory_max_per_day or 1):
                 break
+        logger.debug(
+            "Daily chat memory normalization: raw=%d normalized=%d drops=%s",
+            len(candidates or []),
+            len(normalized),
+            drop_counts,
+        )
         return normalized
 
     def _apply_daily_chat_memory_candidate_edit(self, candidate: dict, edit: Any) -> dict:

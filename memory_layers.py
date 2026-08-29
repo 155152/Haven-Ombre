@@ -249,7 +249,7 @@ def infer_bucket_layer(bucket: dict[str, Any] | None) -> str:
     tags = _tags(meta)
     bucket_type = _lower(meta.get("type") or meta.get("bucket_type"))
 
-    if _truthy(meta.get("archived")) or _truthy(meta.get("digested")) or _truthy(meta.get("resolved")):
+    if _truthy(meta.get("archived")) or _truthy(meta.get("resolved")):
         return LAYER_ARCHIVE
     if bucket_type == "archived":
         return LAYER_ARCHIVE
@@ -263,6 +263,8 @@ def infer_bucket_layer(bucket: dict[str, Any] | None) -> str:
         return LAYER_CORE
     if _truthy(meta.get("anchor")) or _truthy(meta.get("bucket_anchor")):
         return LAYER_ANCHOR
+    if _truthy(meta.get("digested")):
+        return LAYER_ARCHIVE
     if _has_favorite_tag(tags):
         return LAYER_FAVORITE
     if bucket_type == "feel":

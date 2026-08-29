@@ -3683,6 +3683,8 @@ def _bucket_needs_memory_enrichment(bucket: dict) -> bool:
     meta = bucket.get("metadata", {}) if isinstance(bucket, dict) else {}
     if is_self_anchor_bucket(bucket):
         return False
+    if infer_bucket_layer(bucket) == LAYER_SOURCE_RECORD:
+        return False
     if meta.get("type") == "feel" or meta.get("protected"):
         return False
     try:
@@ -3694,7 +3696,13 @@ def _bucket_needs_memory_enrichment(bucket: dict) -> bool:
 
 def _bucket_allows_memory_edge_backfill(bucket: dict) -> bool:
     meta = bucket.get("metadata", {}) if isinstance(bucket, dict) else {}
-    return bool(bucket and not is_self_anchor_bucket(bucket) and meta.get("type") != "feel" and not meta.get("protected"))
+    return bool(
+        bucket
+        and not is_self_anchor_bucket(bucket)
+        and infer_bucket_layer(bucket) != LAYER_SOURCE_RECORD
+        and meta.get("type") != "feel"
+        and not meta.get("protected")
+    )
 
 
 async def _backfill_memory_enrichment(
@@ -8981,6 +8989,87 @@ async def trace(
     if "anchor" in updates:
         changed += " → 已标为 anchor" if updates["anchor"] else " → 已取消 anchor"
     return f"已修改记忆桶 {bucket_id}: {changed}"
+
+
+# =============================================================
+# Tool 4.5: daily chat memory review — review-only history mining
+# 工具 4.5：每日聊天记忆审阅 — 只生成候选，不自动写长期记忆
+# =============================================================
+@mcp.tool()
+async def daily_chat_memory_review(
+    date: str,
+    force: bool = True,
+    preserve_cursor: bool = True,
+    turn_limit: int = 60,
+    turn_offset: int = 0,
+    summarize: bool = False,
+    max_candidates: int = 3,
+    candidate_max_tokens: int = 1600,
+    min_confidence: float = 0.0,
+) -> dict:
+    """按日期审阅 raw chat，只生成 pending candidates；硬编码 review 模式，不自动写长期 bucket。默认最多读取 60 turns、关闭窗口摘要，并恢复原 daily-chat cursor 与运行参数。"""
+    date_key = str(date or "").strip()
+    if not date_key:
+        return {"status": "error", "reason": "date_required"}
+
+    previous_cursor = reflection_engine._load_daily_chat_memory_cursor() if preserve_cursor else None
+    previous_turn_limit = reflection_engine.daily_chat_memory_turn_limit
+    previous_summary_enabled = reflection_engine.daily_chat_memory_summary_enabled
+    previous_candidate_max_tokens = reflection_engine.daily_chat_memory_candidate_max_tokens
+    previous_review_max_per_day = reflection_engine.daily_chat_memory_review_max_per_day
+    previous_review_min_confidence = reflection_engine.daily_chat_memory_review_min_confidence
+    reflection_engine.daily_chat_memory_turn_limit = max(1, min(200, int(turn_limit or 60)))
+    reflection_engine.daily_chat_memory_summary_enabled = bool(summarize)
+    reflection_engine.daily_chat_memory_review_max_per_day = max(1, min(5, int(max_candidates or 3)))
+    reflection_engine.daily_chat_memory_candidate_max_tokens = max(600, min(2400, int(candidate_max_tokens or 1600)))
+    reflection_engine.daily_chat_memory_review_min_confidence = max(0.0, min(1.0, float(min_confidence)))
+    result: dict = {}
+    try:
+        result = await reflection_engine.run_daily_chat_memory(
+            bucket_mgr,
+            conversation_turn_store=gateway_state_store,
+            raw_event_store=raw_event_store,
+            persona_engine=persona_engine,
+            embedding_engine=embedding_engine,
+            key=date_key,
+            mode="review",
+            force=bool(force),
+            raw_event_offset=max(0, int(turn_offset or 0)),
+        )
+        return {
+            **result,
+            "review_only": True,
+            "cursor_preserved": bool(preserve_cursor),
+            "turn_limit": reflection_engine.daily_chat_memory_turn_limit,
+            "turn_offset": max(0, int(turn_offset or 0)),
+            "summarize": reflection_engine.daily_chat_memory_summary_enabled,
+            "max_candidates": reflection_engine.daily_chat_memory_review_max_per_day,
+            "candidate_max_tokens": reflection_engine.daily_chat_memory_candidate_max_tokens,
+            "min_confidence": reflection_engine.daily_chat_memory_review_min_confidence,
+        }
+    finally:
+        reflection_engine.daily_chat_memory_turn_limit = previous_turn_limit
+        reflection_engine.daily_chat_memory_summary_enabled = previous_summary_enabled
+        reflection_engine.daily_chat_memory_review_max_per_day = previous_review_max_per_day
+        reflection_engine.daily_chat_memory_candidate_max_tokens = previous_candidate_max_tokens
+        reflection_engine.daily_chat_memory_review_min_confidence = previous_review_min_confidence
+        if preserve_cursor and previous_cursor is not None:
+            pending_items = reflection_engine._load_daily_chat_memory_pending()
+            reflection_engine._save_daily_chat_memory_pending(
+                pending_items,
+                cursor=previous_cursor,
+            )
+
+
+@mcp.tool()
+async def daily_chat_memory_pending(status: str = "pending", limit: int = 50) -> dict:
+    """只读列出 daily chat memory 审阅候选；不会确认、拒绝或写长期记忆。"""
+    safe_limit = max(1, min(200, int(limit or 50)))
+    items = reflection_engine.list_daily_chat_memory_pending(
+        status=str(status or "pending"),
+        limit=safe_limit,
+    )
+    return {"status": "ok", "count": len(items), "items": items}
 
 
 # =============================================================
