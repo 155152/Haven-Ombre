@@ -4,6 +4,8 @@ tests/
 tests/*
 !tests/test_memory_guards.py
 !tests/test_backfill_cyberboss_memory.py
+!tests/test_backfill_historical_llm_memory.py
+.chatgpt-historical-backfill/
 *.pyc
 *.pyo
 .env
