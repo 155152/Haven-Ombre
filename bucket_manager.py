@@ -110,6 +110,11 @@ class BucketManager:
             str,
             tuple[tuple, Counter[str], float, tuple[str, str, str, str]],
         ] = {}
+        # Parsed bucket files are expensive at scale. Keep a per-process cache keyed
+        # by file mtime+size so list_all() only reparses files that actually changed.
+        # This preserves immediate visibility for cross-process writes without a
+        # long freshness TTL.
+        self._bucket_file_cache: dict[str, tuple[tuple[int, int], dict]] = {}
 
     # ---------------------------------------------------------
     # Create a new bucket
@@ -1271,13 +1276,16 @@ class BucketManager:
     async def list_all(self, include_archive: bool = False) -> list[dict]:
         """
         Recursively walk directories (including domain subdirs), list all buckets.
-        递归遍历目录（含域子目录），列出所有记忆桶。
+        Reuse parsed buckets whose file mtime and size have not changed.
+        递归遍历目录（含域子目录），仅重载实际发生变化的记忆桶。
         """
         buckets = []
 
         dirs = [self.permanent_dir, self.dynamic_dir, self.feel_dir]
         if include_archive:
             dirs.append(self.archive_dir)
+        scanned_roots = [os.path.normcase(os.path.abspath(path)) for path in dirs]
+        seen_paths: set[str] = set()
 
         for dir_path in dirs:
             if not os.path.exists(dir_path):
@@ -1287,9 +1295,32 @@ class BucketManager:
                     if not filename.endswith(".md"):
                         continue
                     file_path = os.path.join(root, filename)
-                    bucket = self._load_bucket(file_path)
+                    cache_key = os.path.normcase(os.path.abspath(file_path))
+                    seen_paths.add(cache_key)
+                    try:
+                        stat = os.stat(file_path)
+                        signature = (int(stat.st_mtime_ns), int(stat.st_size))
+                    except OSError:
+                        self._bucket_file_cache.pop(cache_key, None)
+                        continue
+                    cached = self._bucket_file_cache.get(cache_key)
+                    if cached and cached[0] == signature:
+                        bucket = cached[1]
+                    else:
+                        bucket = self._load_bucket(file_path)
+                        if bucket:
+                            self._bucket_file_cache[cache_key] = (signature, bucket)
+                        else:
+                            self._bucket_file_cache.pop(cache_key, None)
                     if bucket:
                         buckets.append(bucket)
+
+        # Remove entries deleted or moved out of the roots scanned by this call.
+        for cache_key in list(self._bucket_file_cache):
+            if cache_key in seen_paths:
+                continue
+            if any(cache_key == root or cache_key.startswith(root + os.sep) for root in scanned_roots):
+                self._bucket_file_cache.pop(cache_key, None)
 
         return buckets
 
@@ -1458,7 +1489,7 @@ class BucketManager:
         """
         try:
             raw = Path(file_path).read_text(encoding="utf-8")
-            post = frontmatter.load(file_path)
+            post = frontmatter.loads(raw)
             return {
                 "id": post.get("id", Path(file_path).stem),
                 "metadata": dict(post.metadata),

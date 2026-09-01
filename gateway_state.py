@@ -138,6 +138,17 @@ class GatewayStateStore:
             ON upstream_usage (session_id, id DESC)
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS hook_completions (
+                session_id TEXT NOT NULL,
+                turn_id TEXT NOT NULL,
+                round_id INTEGER NOT NULL,
+                completed_at TEXT NOT NULL,
+                PRIMARY KEY (session_id, turn_id)
+            )
+            """
+        )
         conn.commit()
         conn.close()
 
@@ -171,6 +182,76 @@ class GatewayStateStore:
         conn.commit()
         conn.close()
         return next_round
+
+    def record_hook_completion(
+        self,
+        session_id: str,
+        turn_id: str,
+        bucket_ids: list[str],
+        *,
+        recent_context_injected: bool = False,
+        completed_at: datetime | None = None,
+    ) -> dict[str, Any]:
+        session_id = str(session_id or "").strip()
+        turn_id = str(turn_id or "").strip()
+        if not session_id or not turn_id:
+            raise ValueError("session_id and turn_id are required")
+        completed_at = completed_at or datetime.now()
+        completed_iso = completed_at.isoformat(timespec="seconds")
+        normalized_bucket_ids = list(
+            dict.fromkeys(str(bucket_id or "").strip() for bucket_id in (bucket_ids or []) if str(bucket_id or "").strip())
+        )
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                "SELECT round_id FROM hook_completions WHERE session_id = ? AND turn_id = ?",
+                (session_id, turn_id),
+            ).fetchone()
+            if existing:
+                conn.commit()
+                return {"recorded": False, "round_id": int(existing["round_id"])}
+            row = conn.execute(
+                "SELECT COALESCE(MAX(round_id), 0) AS current_round FROM request_rounds WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            next_round = int(row["current_round"]) + 1
+            conn.execute(
+                "INSERT INTO request_rounds (session_id, round_id, completed_at) VALUES (?, ?, ?)",
+                (session_id, next_round, completed_iso),
+            )
+            for bucket_id in normalized_bucket_ids:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO injected_buckets
+                    (session_id, round_id, bucket_id, injected_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (session_id, next_round, bucket_id, completed_iso),
+                )
+            if recent_context_injected:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO recent_context_injections
+                    (session_id, round_id, injected_at)
+                    VALUES (?, ?, ?)
+                    """,
+                    (session_id, next_round, completed_iso),
+                )
+            conn.execute(
+                """
+                INSERT INTO hook_completions (session_id, turn_id, round_id, completed_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (session_id, turn_id, next_round, completed_iso),
+            )
+            conn.commit()
+            return {"recorded": True, "round_id": next_round}
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def get_current_round(self, session_id: str) -> int:
         conn = self._connect()

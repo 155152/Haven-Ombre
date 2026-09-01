@@ -19,11 +19,16 @@ ENTITY_RELATIONS = {
     "shared_anchor",
 }
 
+USER_RELATION_SUBJECT_BRIDGE = (
+    r"(?:明确(?:表示|说)?(?:自己)?|直接(?:表示|说)?(?:自己)?|"
+    r"说(?:自己)?|表示(?:自己)?|承认(?:自己)?|确认(?:自己)?|自己)?\s*"
+)
+
 USER_RELATION_SPECS = (
     ("dislikes", r"(?:很|最|一直|特别|也|更)?不喜欢\s*([^。；;，,\n]{1,40})"),
     ("dislikes", r"(?:很|最|一直|特别|也|更)?讨厌\s*([^。；;，,\n]{1,40})"),
     ("dislikes", r"(?:很|最|一直|特别|也|更)?厌恶\s*([^。；;，,\n]{1,40})"),
-    ("likes", r"(?:很|最|一直|特别|也|更|偏)?喜欢\s*([^。；;，,\n]{1,40})"),
+    ("likes", r"(?:很|最|一直|特别|也|更|偏)?(?<!不)喜欢\s*([^。；;，,\n]{1,40})"),
     ("prefers", r"偏好\s*([^。；;，,\n]{1,40})"),
     ("fears", r"(?:很|最|一直|特别|也|更)?害怕\s*([^。；;，,\n]{1,40})"),
     ("boundary", r"(?:的)?雷点是\s*([^。；;，,\n]{1,40})"),
@@ -155,6 +160,16 @@ NOISY_OBJECTS = {
     "这类东西",
     "它的原因",
     "原因",
+    "玩法",
+    "偏好",
+    "习惯",
+    "继续",
+    "调整",
+    "重新调整",
+    "反馈",
+    "原则",
+    "方式",
+    "内容",
 }
 
 
@@ -372,9 +387,9 @@ def extract_entity_edges_from_bucket(bucket: dict, identity: dict | None = None)
     ai_subject_pattern = ai_pattern + r"(?![-_/A-Za-z0-9])"
 
     for relation, tail in USER_RELATION_SPECS:
-        pattern = re.compile(user_pattern + tail, re.IGNORECASE)
+        pattern = re.compile(user_pattern + USER_RELATION_SUBJECT_BRIDGE + tail, re.IGNORECASE)
         for match in pattern.finditer(relation_text):
-            obj = _clean_entity_object(match.group(1))
+            obj = _clean_user_relation_object(match.group(1), identity)
             if not _valid_entity_object(obj, identity):
                 continue
             edges.append(
@@ -387,11 +402,16 @@ def extract_entity_edges_from_bucket(bucket: dict, identity: dict | None = None)
                     evidence=_clip_text(match.group(0), 160),
                 )
             )
+        # Continuation recovery is intentionally limited to positive likes.
+        # Negative/preference labels such as “如果不喜欢都可以停” or “偏好：…”
+        # are too easy to misread without an explicit subject immediately attached.
+        if relation != "likes":
+            continue
         continuation_pattern = re.compile(tail, re.IGNORECASE)
         for match in continuation_pattern.finditer(relation_text):
             if not _has_user_context_before(relation_text, match.start(), identity):
                 continue
-            obj = _clean_entity_object(match.group(1))
+            obj = _clean_user_relation_object(match.group(1), identity)
             if not _valid_entity_object(obj, identity):
                 continue
             edges.append(
@@ -421,7 +441,7 @@ def extract_entity_edges_from_bucket(bucket: dict, identity: dict | None = None)
         )
 
     if _looks_shared_anchor(text, title, identity):
-        shared_object = _shared_anchor_object(title, text)
+        shared_object = _shared_anchor_object(title, relation_text, identity)
         if shared_object:
             edges.append(
                 _edge(
@@ -564,12 +584,25 @@ def _has_user_context_before(text: str, start: int, identity: dict) -> bool:
     return max(user_positions) >= max(ai_positions or [-1])
 
 
-def _shared_anchor_object(title: str, text: str) -> str:
-    title = _clean_entity_object(title)
-    if title and _valid_object_key(title):
+def _shared_anchor_object(title: str, text: str, identity: dict) -> str:
+    title = _canonicalize_entity_object_person(title, identity)
+    if title and _valid_object_key(title) and not _looks_storage_identifier(title):
         return title[:80]
     first = re.split(r"[。！？!?；;\n]", text.strip(), maxsplit=1)[0]
-    return _clean_entity_object(first)[:80]
+    first = _canonicalize_entity_object_person(first, identity)
+    if _looks_storage_identifier(first):
+        return ""
+    return first[:80]
+
+
+def _looks_storage_identifier(value: Any) -> bool:
+    text = str(value or "").strip()
+    return bool(
+        re.fullmatch(
+            r"(?:source_[A-Za-z0-9_-]+|historical_[A-Fa-f0-9]+|daily_chat_memory_[A-Za-z0-9_-]+)",
+            text,
+        )
+    )
 
 
 def _query_object_terms(query: str, relation: str) -> list[str]:
@@ -673,6 +706,41 @@ def _clean_entity_object(value: Any) -> str:
     text = re.sub(r"\s+", "", text)
     text = re.sub(r"(这件事|这个设定|这类东西|的时候)$", "", text)
     return text[:80].strip("。；;，,、 :：")
+
+
+def _canonicalize_entity_object_person(value: Any, identity: dict) -> str:
+    text = _clean_entity_object(value)
+    user_subject = _canonical_user_subject(identity)
+    text = text.replace("给我的", f"给{user_subject}的")
+    text = text.replace("对我的", f"对{user_subject}的")
+    text = text.replace("和我的", f"和{user_subject}的")
+    text = text.replace("与我的", f"与{user_subject}的")
+    text = re.sub(r"^我的", f"{user_subject}的", text)
+    return _clean_entity_object(text)
+
+
+def _clean_user_relation_object(value: Any, identity: dict) -> str:
+    text = _canonicalize_entity_object_person(value, identity)
+    if not text:
+        return ""
+    # Reject contrast/question captures such as “32喜欢的不只是……而是……”.
+    # They do not describe one clean preference object and otherwise produce
+    # misleading fragments like “的味道是不是老公味”.
+    if re.match(r"^的?(?:不只是|不仅是|不止是|并不只是|并不仅是|是不是|是否)", text):
+        return ""
+    if re.search(r"(?:既能|既会|不但|不仅)", text):
+        return ""
+    text = re.sub(r"^的(?:是|就是)", "", text)
+    if text.startswith("的"):
+        return ""
+
+    # Reject meta labels that merely restate another preference sentence.
+    user_terms = _terms_pattern(_user_terms(identity))
+    if re.match(user_terms + r"(?:喜欢|偏好|不喜欢|讨厌|害怕)", text, re.IGNORECASE):
+        return ""
+    if re.search(r"(?:^|[^A-Za-z0-9])我(?:的|自己|本人)?", text):
+        return ""
+    return _clean_entity_object(text)
 
 
 def _clean_participation_object(value: Any) -> str:

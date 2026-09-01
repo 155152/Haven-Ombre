@@ -181,6 +181,8 @@ DAILY_CHAT_MEMORY_PROMPT_TEMPLATE = """这是 {user_display_name} 和 {ai_name} 
 
 请从中挑出真正值得未来想起的内容，写成长期记忆候选。
 不要复制聊天原句，不要写成项目报告。
+长期记忆正文里的事实、事件、偏好、边界、承诺、项目状态和关系锚点，必须使用明确主体 {user_display_name} / {ai_name}；不要用“我 / 你 / 我们”代替主体，避免以后跨模型、跨会话读取时发生人称漂移。
+这里的人称规则只约束这类客观长期记忆正文；Ombre 的 reflection / feel / whisper / darkroom 等主观自我层仍按各自规则使用第一人称“我”。
 没有值得留下的内容就返回空。
 
 最多输出 {max_candidates} 条，只输出 JSON：
@@ -261,6 +263,7 @@ DAILY_CHAT_MEMORY_SUMMARY_PROMPT_TEMPLATE = """你是 {ai_name} 的对话压缩�
 规则：
 - 每个窗口最多输出 4 条 summary；每条围绕一个可能的长期记忆点。没有长期价值信号时返回 {"summaries": []}。
 - summary 要能让下一步模型在不看完整原文时仍理解上下文，不要压成一句泛泛结论。
+- summary 也要使用明确主体 {user_display_name} / {ai_name} 描述双方，不要用含混的“我 / 你 / 我们”代替主体；它虽不是最终记忆正文，但要为下一步保持稳定人称。
 - summary 通常 80 到 320 字；写清背景、因果、已确认内容、未完成点。不要输出 Markdown。
 - 如果信号出现在窗口开头或结尾，保留“前文可能已铺垫 / 后文可能继续确认”的边界提醒，不要把未确认因果说死。
 - source_event_ids / source_turn_ids 只能使用输入里真实出现的 id；拿不准可留空。

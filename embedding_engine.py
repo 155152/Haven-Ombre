@@ -19,6 +19,7 @@ import logging
 import asyncio
 from pathlib import Path
 
+import numpy as np
 from openai import AsyncOpenAI
 
 logger = logging.getLogger("ombre_brain.embedding")
@@ -65,6 +66,12 @@ class EmbeddingEngine:
 
         # --- Initialize SQLite ---
         self._init_db()
+        # Semantic search used to JSON-decode every stored vector and calculate
+        # cosine similarity in Python on every query. Cache one normalized NumPy
+        # matrix per process and rebuild only when the SQLite store changes.
+        self._search_cache_signature: tuple[int, int, int, int] | None = None
+        self._search_cache_bucket_ids: list[str] = []
+        self._search_cache_matrix: np.ndarray | None = None
 
     def _init_db(self):
         """Create embeddings table if not exists."""
@@ -133,6 +140,7 @@ class EmbeddingEngine:
         )
         conn.commit()
         conn.close()
+        self._invalidate_search_cache()
 
     def delete_embedding(self, bucket_id: str):
         """Remove embedding when bucket is deleted."""
@@ -140,6 +148,7 @@ class EmbeddingEngine:
         conn.execute("DELETE FROM embeddings WHERE bucket_id = ?", (bucket_id,))
         conn.commit()
         conn.close()
+        self._invalidate_search_cache()
 
     async def get_embedding(self, bucket_id: str) -> list[float] | None:
         """Retrieve stored embedding for a bucket. Returns None if not found."""
@@ -191,9 +200,9 @@ class EmbeddingEngine:
 
     async def search_similar(self, query: str, top_k: int = 10) -> list[tuple[str, float]]:
         """
-        Search for buckets similar to query text.
+        Search for buckets similar to query text using a cached normalized matrix.
         Returns list of (bucket_id, similarity_score) sorted by score desc.
-        搜索与查询文本相似的桶。返回 (bucket_id, 相似度分数) 列表。
+        搜索与查询文本相似的桶。向量矩阵仅在 SQLite 变化时重建。
         """
         if not self.enabled:
             return []
@@ -206,28 +215,95 @@ class EmbeddingEngine:
             logger.warning(f"Query embedding failed: {e}")
             return []
 
-        # Load all embeddings from SQLite
-        conn = sqlite3.connect(self.db_path)
-        rows = conn.execute("SELECT bucket_id, embedding, model, dimension FROM embeddings").fetchall()
-        conn.close()
-
-        if not rows:
+        bucket_ids, matrix = self._search_index()
+        if matrix is None or not bucket_ids or matrix.size == 0:
             return []
 
-        # Calculate cosine similarity
-        results = []
+        query_vector = np.asarray(query_embedding, dtype=np.float32)
+        if query_vector.ndim != 1 or matrix.shape[1] != query_vector.shape[0]:
+            return []
+        norm = float(np.linalg.norm(query_vector))
+        if norm <= 0:
+            return []
+        query_vector = query_vector / norm
+        scores = matrix @ query_vector
+        count = max(0, min(int(top_k), len(bucket_ids)))
+        if count <= 0:
+            return []
+        if count >= len(bucket_ids):
+            indices = np.argsort(scores)[::-1]
+        else:
+            indices = np.argpartition(scores, len(scores) - count)[-count:]
+            indices = indices[np.argsort(scores[indices])[::-1]]
+        return [(bucket_ids[int(index)], float(scores[int(index)])) for index in indices[:count]]
+
+    def warm_search_cache(self) -> int:
+        """Build the normalized semantic matrix before the first user recall."""
+        bucket_ids, _matrix = self._search_index(force=True)
+        return len(bucket_ids)
+
+    def _search_index(self, *, force: bool = False) -> tuple[list[str], np.ndarray | None]:
+        signature = self._embedding_store_signature()
+        if (
+            not force
+            and self._search_cache_matrix is not None
+            and self._search_cache_signature == signature
+        ):
+            return self._search_cache_bucket_ids, self._search_cache_matrix
+
+        conn = sqlite3.connect(self.db_path)
+        try:
+            rows = conn.execute(
+                "SELECT bucket_id, embedding, model, dimension FROM embeddings"
+            ).fetchall()
+        finally:
+            conn.close()
+
+        bucket_ids: list[str] = []
+        vectors: list[np.ndarray] = []
+        expected_dimension: int | None = None
         for bucket_id, emb_json, model, dimension in rows:
             try:
                 stored_embedding = json.loads(emb_json)
                 if not self._row_matches_current_model(model, dimension, stored_embedding):
                     continue
-                sim = self._cosine_similarity(query_embedding, stored_embedding)
-                results.append((bucket_id, sim))
-            except (json.JSONDecodeError, Exception):
+                vector = np.asarray(stored_embedding, dtype=np.float32)
+                if vector.ndim != 1 or vector.size == 0:
+                    continue
+                if expected_dimension is None:
+                    expected_dimension = int(vector.size)
+                if int(vector.size) != expected_dimension:
+                    continue
+                norm = float(np.linalg.norm(vector))
+                if norm <= 0:
+                    continue
+                bucket_ids.append(str(bucket_id))
+                vectors.append(vector / norm)
+            except (json.JSONDecodeError, TypeError, ValueError):
                 continue
 
-        results.sort(key=lambda x: x[1], reverse=True)
-        return results[:top_k]
+        matrix = np.vstack(vectors).astype(np.float32, copy=False) if vectors else None
+        self._search_cache_bucket_ids = bucket_ids
+        self._search_cache_matrix = matrix
+        self._search_cache_signature = self._embedding_store_signature()
+        return bucket_ids, matrix
+
+    def _invalidate_search_cache(self) -> None:
+        self._search_cache_signature = None
+        self._search_cache_bucket_ids = []
+        self._search_cache_matrix = None
+
+    def _embedding_store_signature(self) -> tuple[int, int, int, int]:
+        def stat_pair(path: str) -> tuple[int, int]:
+            try:
+                stat = os.stat(path)
+                return int(stat.st_mtime_ns), int(stat.st_size)
+            except OSError:
+                return 0, 0
+
+        db_mtime, db_size = stat_pair(self.db_path)
+        wal_mtime, wal_size = stat_pair(f"{self.db_path}-wal")
+        return db_mtime, db_size, wal_mtime, wal_size
 
     def _prepare_embedding_input(self, text: str, *, kind: str) -> str:
         raw = str(text or "")

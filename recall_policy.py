@@ -153,6 +153,12 @@ RESPONSE_ACTION_QUERY_MARKERS = frozenset(
         "跟一句",
         "说个",
         "说一句",
+        "说点",
+        "聊点",
+        "聊会儿",
+        "陪我聊",
+        "逗逗我",
+        "哄哄我",
         "发个",
         "发一句",
         "补个",
@@ -182,6 +188,18 @@ RESPONSE_ACTION_FILLER_TERMS = frozenset(
         "跟一句",
         "说个",
         "说一句",
+        "说点",
+        "聊点",
+        "聊会儿",
+        "陪我聊",
+        "逗逗我",
+        "哄哄我",
+        "轻松",
+        "轻松的",
+        "好玩",
+        "好玩的",
+        "开心",
+        "随便",
         "发个",
         "发一句",
         "补个",
@@ -1730,6 +1748,7 @@ class RecallPolicy:
         removable = list(
             RESPONSE_ACTION_FILLER_TERMS
             | AUTO_VAGUE_FILLER_TERMS
+            | SHORT_CASUAL_FILLER_TERMS
             | set(self.options.context_terms)
         )
         for term in sorted(removable, key=len, reverse=True):

@@ -23,6 +23,8 @@ if str(ROOT) not in sys.path:
 from bucket_manager import BucketManager
 from entity_edges import extract_entity_edges_from_bucket
 from identity import identity_names
+from memory_layers import LAYER_SOURCE_RECORD, infer_bucket_layer
+from self_anchor import is_self_anchor_bucket
 from utils import load_config
 
 
@@ -100,6 +102,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def _compact(value: Any) -> str:
     return re.sub(r"[\s。；;，,、：:\"'“”‘’「」『』【】\[\]（）()!?！？~～._-]+", "", str(value or "").lower())
+
+
+def _eligible_entity_edge_bucket(bucket: dict[str, Any]) -> bool:
+    meta = bucket.get("metadata") if isinstance(bucket.get("metadata"), dict) else {}
+    return bool(
+        bucket
+        and not is_self_anchor_bucket(bucket)
+        and infer_bucket_layer(bucket) != LAYER_SOURCE_RECORD
+        and meta.get("type") != "feel"
+        and not meta.get("protected")
+    )
 
 
 def _bucket_name(bucket: dict[str, Any]) -> str:
@@ -462,7 +475,8 @@ async def audit(args: argparse.Namespace) -> dict[str, Any]:
         raise FileNotFoundError(f"Buckets dir does not exist: {buckets_dir}")
 
     bucket_mgr = BucketManager(config)
-    buckets = await bucket_mgr.list_all(include_archive=not args.exclude_archive)
+    all_buckets = await bucket_mgr.list_all(include_archive=not args.exclude_archive)
+    buckets = [bucket for bucket in all_buckets if _eligible_entity_edge_bucket(bucket)]
     bucket_by_id = {str(bucket.get("id") or ""): bucket for bucket in buckets if bucket.get("id")}
     identity = identity_names(config)
 

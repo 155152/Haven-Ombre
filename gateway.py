@@ -844,6 +844,12 @@ class GatewayService:
         lexical_buckets = self.bucket_mgr.warm_lexical_profiles(all_buckets)
         lexical_profiles_ms = max(0, int((time.perf_counter() - stage_started_at) * 1000))
         stage_started_at = time.perf_counter()
+        semantic_vectors = 0
+        warm_semantic = getattr(self.embedding_engine, "warm_search_cache", None)
+        if callable(warm_semantic) and getattr(self.embedding_engine, "enabled", False):
+            semantic_vectors = await asyncio.to_thread(warm_semantic)
+        semantic_cache_ms = max(0, int((time.perf_counter() - stage_started_at) * 1000))
+        stage_started_at = time.perf_counter()
         for bucket in all_buckets:
             facets_for_node(self._bucket_relevance_node(bucket), self.relevance_options)
         for moment in moments:
@@ -851,16 +857,18 @@ class GatewayService:
         relevance_facets_ms = max(0, int((time.perf_counter() - stage_started_at) * 1000))
         logger.info(
             "Gateway recall runtime warmed | latency_ms=%s query_plan_ms=%s list_buckets_ms=%s "
-            "moment_graph_ms=%s lexical_profiles_ms=%s relevance_facets_ms=%s buckets=%s "
-            "lexical_buckets=%s moments=%s edges=%s",
+            "moment_graph_ms=%s lexical_profiles_ms=%s semantic_cache_ms=%s relevance_facets_ms=%s buckets=%s "
+            "lexical_buckets=%s semantic_vectors=%s moments=%s edges=%s",
             max(0, int((time.perf_counter() - started_at) * 1000)),
             query_plan_ms,
             list_buckets_ms,
             moment_graph_ms,
             lexical_profiles_ms,
+            semantic_cache_ms,
             relevance_facets_ms,
             len(all_buckets),
             lexical_buckets,
+            semantic_vectors,
             len(moments),
             len(edges),
         )
@@ -2179,6 +2187,52 @@ class GatewayService:
             }
         )
 
+    async def handle_hook_complete(self, request: Request) -> JSONResponse:
+        auth_result = self._authorize(request.headers.get("Authorization", ""))
+        if auth_result is not None:
+            return auth_result
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid JSON"}, status_code=400)
+        if not isinstance(body, dict):
+            return JSONResponse({"error": "invalid hook completion request"}, status_code=400)
+        session_id = str(
+            body.get("session_id")
+            or request.headers.get("X-Ombre-Session-Id")
+            or "hook"
+        ).strip() or "hook"
+        turn_id = str(body.get("turn_id") or "").strip()
+        if not turn_id:
+            return JSONResponse({"error": "turn_id is required"}, status_code=400)
+        raw_ids = body.get("recalled_ids")
+        if not isinstance(raw_ids, list):
+            raw_ids = []
+        recalled_ids = list(
+            dict.fromkeys(str(item or "").strip() for item in raw_ids if str(item or "").strip())
+        )[:20]
+        recent_context_injected = bool(body.get("recent_context_injected"))
+        try:
+            result = self.state_store.record_hook_completion(
+                session_id,
+                turn_id,
+                recalled_ids,
+                recent_context_injected=recent_context_injected,
+            )
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        return JSONResponse(
+            {
+                "ok": True,
+                "session_id": session_id,
+                "turn_id": turn_id,
+                "recorded": bool(result.get("recorded")),
+                "round_id": int(result.get("round_id") or 0),
+                "recent_context_injected": recent_context_injected,
+                "recalled_ids": recalled_ids,
+            }
+        )
+
     async def handle_hook_recall(self, request: Request) -> JSONResponse:
         auth_result = self._authorize(request.headers.get("Authorization", ""))
         if auth_result is not None:
@@ -2390,6 +2444,8 @@ class GatewayService:
             "diffused_bucket_ids": list(debug_payload.get("diffused_bucket_ids") or []),
             "just_now_context_injected": bool(debug_payload.get("just_now_context_injected")),
             "date_recall_injected": bool(debug_payload.get("date_recall_injected")),
+            "recent_context_injected": bool(debug_payload.get("recent_context_injected")),
+            "recent_context_reason": str(debug_payload.get("recent_context_reason") or ""),
             "prepare_timing_debug": dict(debug_payload.get("prepare_timing_debug") or {}),
         }
         response: dict[str, Any] = {
@@ -13242,6 +13298,16 @@ class GatewayService:
         if not domains:
             add("general")
 
+        task_markers = [
+            self._compact_lookup_key(term)
+            for term in query_intent_terms("operational_task.task_markers")
+            if self._compact_lookup_key(term)
+        ]
+        operational_task = (
+            any(domain in {"tech", "project"} for domain in domains)
+            and any(marker in compact for marker in task_markers)
+        )
+
         query_terms = self._specific_query_terms(text)[:6]
         planned_query = " ".join(query_terms).strip() or text
         if any(domain in {"relationship", "intimacy"} for domain in domains):
@@ -13253,7 +13319,7 @@ class GatewayService:
                 if name and self._compact_lookup_key(name) not in self._compact_lookup_key(planned_query):
                     planned_query = f"{planned_query} {name}".strip()
 
-        return {
+        payload = {
             "enabled": bool(self.domain_sentinel_enabled),
             "source": "rules",
             "called": False,
@@ -13262,6 +13328,15 @@ class GatewayService:
             "confidence": 0.55 if domains and domains != ["general"] else 0.35,
             "errors": [],
         }
+        if operational_task:
+            payload.update(
+                message_type="troubleshooting",
+                should_recall=False,
+                recall_route="skip",
+                confidence=0.82,
+                reason="operational_task_rules",
+            )
+        return payload
 
     def _domain_sentinel_query_explicitly_needs_memory(self, query: str) -> bool:
         text = str(query or "").strip()
@@ -13278,6 +13353,13 @@ class GatewayService:
         if self.recall_policy.has_axis_relation_marker(text) and self._locatable_query_terms(text):
             return True
         if re.search(r"[A-Za-z]+[A-Za-z0-9_.:-]*\d", text):
+            return True
+        # Upper-case acronyms are usually locatable project/book/product entities
+        # in this memory corpus (AWM, GPT, MCP, etc.). Route them directly to
+        # recall instead of spending several seconds on an LLM classifier.
+        acronym_matches = re.findall(r"(?<![A-Za-z0-9])[A-Z][A-Z0-9_.:-]{2,}(?![A-Za-z0-9])", text)
+        ignored_acronyms = {"LOL", "YES", "NOPE"}
+        if any(match not in ignored_acronyms for match in acronym_matches):
             return True
         return False
 
@@ -13416,7 +13498,16 @@ class GatewayService:
             end = text.rfind("}")
             if start >= 0 and end > start:
                 text = text[start : end + 1]
-        raw = json.loads(text)
+        try:
+            raw = json.loads(text)
+        except json.JSONDecodeError:
+            start = text.find("{")
+            if start < 0:
+                return {}
+            try:
+                raw, _end = json.JSONDecoder().raw_decode(text[start:])
+            except json.JSONDecodeError:
+                return {}
         if not isinstance(raw, dict):
             return {}
         domains = []
@@ -19183,8 +19274,8 @@ class GatewayService:
                 "hook_recall_debug": {"mode": "fast", "skip_reason": "max_cards_zero"},
             }
         query_plan = self._recall_query_plan(query)
-        if getattr(query_plan, "skip_reason", "") == "recall_meta_without_target":
-            query_planner_debug["skip_reason"] = "recall_meta_without_target"
+        if getattr(query_plan, "skip_long_term_recall", False):
+            query_planner_debug["skip_reason"] = str(getattr(query_plan, "skip_reason", "") or "auto_vague_query")
             return [], [], {
                 "query_preview": self._clip_text(query, 500),
                 "domain_sentinel_debug": domain_sentinel_debug,
@@ -21347,6 +21438,9 @@ def create_gateway_app(
     async def hook_recall(request: Request) -> Response:
         return await request.app.state.gateway_service.handle_hook_recall(request)
 
+    async def hook_complete(request: Request) -> Response:
+        return await request.app.state.gateway_service.handle_hook_complete(request)
+
     async def recall_eval_debug(request: Request) -> Response:
         return await request.app.state.gateway_service.handle_recall_eval_debug(request)
 
@@ -21360,6 +21454,7 @@ def create_gateway_app(
             Route("/api/config", config_route, methods=["GET", "POST"]),
             Route("/api/debug/injections", injection_debug, methods=["GET"]),
             Route("/api/hook/recall", hook_recall, methods=["POST"]),
+            Route("/api/hook/complete", hook_complete, methods=["POST"]),
             Route("/api/debug/recall-eval", recall_eval_debug, methods=["GET"]),
             Route("/api/debug/upstream-usage", upstream_usage_debug, methods=["GET"]),
             Route("/v1/models", models, methods=["GET"]),
