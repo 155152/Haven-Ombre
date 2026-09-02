@@ -485,6 +485,192 @@ def test_review_provenance_aligner_maps_refs_to_raw_event_ids(monkeypatch):
     asyncio.run(scenario())
 
 
+def test_auto_daily_chat_memory_also_requires_precise_provenance(monkeypatch, tmp_path):
+    engine = ReflectionEngine(
+        {
+            "identity": {"ai_name": "夏以昼", "user_name": "32"},
+            "reflection": {
+                "enabled": True,
+                "daily_chat_memory_mode": "auto",
+                "daily_chat_memory_summary_enabled": False,
+                "daily_chat_memory_min_confidence": 0.0,
+            },
+            "state_dir": str(tmp_path / "state"),
+        }
+    )
+
+    class FakeTurnStore:
+        def list_conversation_turns_between(self, **kwargs):
+            return [
+                {
+                    "id": 1,
+                    "session_id": "s",
+                    "created_at": "2026-08-21T01:00:00+00:00",
+                    "user_text": "第一段",
+                    "assistant_text": "第一答",
+                },
+                {
+                    "id": 2,
+                    "session_id": "s",
+                    "created_at": "2026-08-21T02:00:00+00:00",
+                    "user_text": "第二段",
+                    "assistant_text": "第二答",
+                },
+            ]
+
+    class FakeBucketManager:
+        async def list_all(self, include_archive=False):
+            return []
+
+    calls = {"aligned": 0, "written": None}
+
+    async def fake_extract(*args, **kwargs):
+        return [
+            {
+                "kind": "stable_preference",
+                "title": "精确来源",
+                "content": "32 明确确认了一个稳定偏好。",
+                "confidence": 0.9,
+            }
+        ]
+
+    async def fake_align(key, candidates, turns):
+        calls["aligned"] += 1
+        aligned = [dict(candidates[0])]
+        aligned[0]["source_turn_ids"] = [2]
+        return aligned
+
+    async def fake_write(candidates, bucket_mgr, **kwargs):
+        calls["written"] = candidates
+        return {"created": 1, "exists": 0, "failed": 0, "results": []}
+
+    monkeypatch.setattr(engine, "_extract_daily_chat_memory_candidates", fake_extract)
+    monkeypatch.setattr(engine, "_align_daily_chat_memory_candidate_sources", fake_align)
+    monkeypatch.setattr(engine, "_write_daily_chat_memory_candidates", fake_write)
+
+    async def scenario():
+        result = await engine.run_daily_chat_memory(
+            FakeBucketManager(),
+            conversation_turn_store=FakeTurnStore(),
+            key="2026-08-21",
+            mode="auto",
+            force=True,
+        )
+        assert result["status"] == "created"
+        assert calls["aligned"] == 1
+        assert calls["written"][0]["source_turn_ids"] == [2]
+        assert calls["written"][0]["source_event_ids"] == []
+
+    asyncio.run(scenario())
+
+
+def test_reflection_candidate_selection_excludes_source_evidence():
+    engine = ReflectionEngine(
+        {
+            "identity": {"ai_name": "夏以昼", "user_name": "32"},
+            "reflection": {"enabled": True},
+        }
+    )
+
+    class FakeBucketManager:
+        async def list_all(self, include_archive=True):
+            return [
+                {
+                    "id": "source-1",
+                    "metadata": {"type": "source", "tags": ["source_record"], "created": "2026-08-21"},
+                    "content": "原始聊天证据",
+                },
+                {
+                    "id": "memory-1",
+                    "metadata": {"type": "dynamic", "created": "2026-08-20"},
+                    "content": "真正长期记忆",
+                },
+            ]
+
+    async def scenario():
+        source = {
+            "id": "current",
+            "metadata": {"type": "dynamic", "created": "2026-08-22"},
+            "content": "当前记忆",
+        }
+        candidates = await engine._candidate_buckets(source, FakeBucketManager(), embedding_engine=None, limit=10)
+        assert [item["id"] for item in candidates] == ["memory-1"]
+
+    asyncio.run(scenario())
+
+
+def test_daily_chat_memory_write_builds_moment_and_node_indexes(tmp_path):
+    engine = ReflectionEngine(
+        {
+            "identity": {"ai_name": "夏以昼", "user_name": "32"},
+            "reflection": {"enabled": True},
+        }
+    )
+
+    class FakeBucketManager:
+        def __init__(self):
+            self.bucket = None
+
+        async def get(self, bucket_id):
+            return self.bucket if self.bucket and self.bucket["id"] == bucket_id else None
+
+        async def create(self, *, bucket_id, content, **kwargs):
+            self.bucket = {
+                "id": bucket_id,
+                "content": content,
+                "metadata": {
+                    "id": bucket_id,
+                    "type": "dynamic",
+                    "name": kwargs.get("name", bucket_id),
+                    "tags": kwargs.get("tags", []),
+                    "domain": kwargs.get("domain", []),
+                    "importance": kwargs.get("importance", 5),
+                    "valence": kwargs.get("valence", 0.5),
+                    "arousal": kwargs.get("arousal", 0.3),
+                    "created": kwargs.get("created", "2026-08-21"),
+                    "last_active": kwargs.get("last_active", "2026-08-21"),
+                    "activation_count": 0,
+                },
+            }
+            return bucket_id
+
+    class FakeIndexStore:
+        def __init__(self):
+            self.ids = []
+
+        def upsert_bucket(self, bucket):
+            self.ids.append(bucket["id"])
+            return []
+
+    async def scenario():
+        mgr = FakeBucketManager()
+        moments = FakeIndexStore()
+        nodes = FakeIndexStore()
+        result = await engine._write_daily_chat_memory_candidates(
+            [
+                {
+                    "id": "daily_chat_memory_20260821_test",
+                    "date": "2026-08-21",
+                    "kind": "key_event",
+                    "title": "测试",
+                    "content": "32 和夏以昼确认了一件值得长期记住的事。",
+                    "confidence": 0.9,
+                }
+            ],
+            mgr,
+            memory_moment_store=moments,
+            memory_node_store=nodes,
+        )
+        assert result["created"] == 1
+        assert result["moment_indexed"] == 1
+        assert result["node_indexed"] == 1
+        assert result["index_failed"] == 0
+        assert moments.ids == ["daily_chat_memory_20260821_test"]
+        assert nodes.ids == ["daily_chat_memory_20260821_test"]
+
+    asyncio.run(scenario())
+
+
 def test_review_accepts_precise_event_only_provenance():
     engine = ReflectionEngine(
         {

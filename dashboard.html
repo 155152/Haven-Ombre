@@ -4470,6 +4470,14 @@ function bucketLegacyDomain(bucket) {
   }).filter(Boolean) : [];
 }
 
+function isSourceEvidenceBucket(bucket) {
+  if (!bucket) return false;
+  return bucketKind(bucket) === 'source_record'
+    || String(bucket.type || '').trim() === 'source'
+    || bucketFlags(bucket).includes('source_record')
+    || bucketTags(bucket).includes('source_record');
+}
+
 function isProfileFactBucket(bucket) {
   if (!bucket) return false;
   var tags = bucketTags(bucket);
@@ -4499,7 +4507,7 @@ function isReflectionEventBucket(bucket) {
 }
 
 function isSurfaceableBucket(bucket) {
-  if (!bucket) return false;
+  if (!bucket || isSourceEvidenceBucket(bucket)) return false;
   var meta = bucket.metadata || bucket || {};
   var type = String(bucket.type || meta.type || '').trim();
   if (type === 'archived' || type === 'permanent' || type === 'feel') return false;
@@ -6004,21 +6012,23 @@ function renderWordMapBoundary(privateTerms, identity) {
 }
 
 function updateStats() {
-  const total = allBuckets.length;
-  const pinned = allBuckets.filter(b => b.pinned).length;
+  const evidence = allBuckets.filter(isSourceEvidenceBucket).length;
+  const total = allBuckets.length - evidence;
+  const pinned = allBuckets.filter(b => !isSourceEvidenceBucket(b) && b.pinned).length;
   const anchors = allBuckets.filter(b => b.anchor).length;
   const feels = allBuckets.filter(b => b.type === 'feel').length;
   const resolved = allBuckets.filter(b => b.resolved).length;
   const digested = allBuckets.filter(b => b.digested).length;
   const archived = allBuckets.filter(b => b.type === 'archived').length;
   document.getElementById('stats').textContent =
-    total + ' 桶 · ' + pinned + ' 钉选 · ' + anchors + ' anchor · ' + feels + ' feel · ' + resolved + ' 已沉底 · ' + digested + ' 已消化 · ' + archived + ' 归档';
+    total + ' 记忆 · ' + evidence + ' 原始证据 · ' + pinned + ' 钉选 · ' + anchors + ' anchor · ' + feels + ' feel · ' + resolved + ' 已沉底 · ' + digested + ' 已消化 · ' + archived + ' 归档';
 }
 
 function buildFilters() {
   const filters = document.getElementById('filters');
   const legacyViewFilters = [
-    { key: 'all', label: '全部' },
+    { key: 'all', label: '全部记忆' },
+    { key: 'source_evidence', label: '原始证据' },
     { key: 'pinned', label: '📌 钉选' },
     { key: 'anchor', label: '⚓ Anchor' },
     { key: 'feel', label: 'Feel' },
@@ -6058,8 +6068,9 @@ function buildFilters() {
 }
 
 function filterBuckets(buckets) {
-  if (currentFilter === 'all') return buckets;
-  if (currentFilter === 'pinned') return buckets.filter(function(b) { return b.pinned; });
+  if (currentFilter === 'all') return buckets.filter(function(b) { return !isSourceEvidenceBucket(b); });
+  if (currentFilter === 'source_evidence') return buckets.filter(isSourceEvidenceBucket);
+  if (currentFilter === 'pinned') return buckets.filter(function(b) { return !isSourceEvidenceBucket(b) && b.pinned; });
   if (currentFilter === 'anchor') return buckets.filter(function(b) { return b.anchor; });
   if (currentFilter === 'feel') return buckets.filter(function(b) { return b.type === 'feel' && !isDailyImpressionBucket(b); });
   if (currentFilter === 'daily_impression') return buckets.filter(isDailyImpressionBucket);
@@ -6140,10 +6151,12 @@ function toggleBucketSortMode() {
 }
 
 function bucketBulkDeleteBlockReason(bucket) {
+  if (isSourceEvidenceBucket(bucket)) return 'source_evidence';
   return '';
 }
 
 function bucketBulkReasonText(reason) {
+  if (reason === 'source_evidence') return '原始证据不参与普通记忆批量删除';
   if (reason === 'protected') return '受保护记忆不能批量删除';
   if (reason === 'pinned') return '钉选记忆不能批量删除';
   if (reason === 'anchor') return '长期锚点不能批量删除';
@@ -6373,7 +6386,7 @@ function renderBuckets(buckets) {
       '<span class="name" title="' + esc(b.name) + '">' + esc(b.name) + '</span>' +
       '<span class="domain" title="key: ' + escAttr(canonicalLabel || '—') + ' · legacy: ' + escAttr(legacyLabel || '—') + '">' + esc(domainLabel || legacyLabel || '—') + '</span>' +
       '<span class="emotion"><span class="v-bar"><span class="v-dot" style="left:' + vPos + '%"></span></span>' + modelV + '</span>' +
-      '<span class="score">' + b.score.toFixed(2) + '</span>' +
+      '<span class="score">' + (isSourceEvidenceBucket(b) ? '证据' : b.score.toFixed(2)) + '</span>' +
       '<span class="time">' + esc(timeAgo) + '</span>' +
       '<span class="preview">' + esc(b.content_preview) + '</span>' +
     '</div>';
@@ -6466,7 +6479,7 @@ async function showDetail(id) {
             '</div>' +
           '</form>' +
         '</div>' +
-        '<div class="field"><label>权重分</label>' + b.score.toFixed(4) + '</div>' +
+        '<div class="field"><label>权重分</label>' + (isSourceEvidenceBucket(b) ? '不参与衰减排序（原始证据）' : b.score.toFixed(4)) + '</div>' +
         '<div class="field"><label>激活次数</label>' + (meta.activation_count || 0) + '</div>' +
         '<div class="field"><label>可浮现</label>' + (isSurfaceableBucket(b) ? '✓' : '—') + '</div>' +
         '<div class="field"><label>已消化</label>' + (meta.digested ? '✓' : '—') + '</div>' +

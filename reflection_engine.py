@@ -991,6 +991,8 @@ class ReflectionEngine:
         embedding_engine=None,
         conversation_turn_store=None,
         raw_event_store=None,
+        memory_moment_store=None,
+        memory_node_store=None,
     ) -> list[dict]:
         if not self.enabled or not self.auto_enabled:
             return []
@@ -1006,6 +1008,8 @@ class ReflectionEngine:
                 raw_event_store=raw_event_store,
                 persona_engine=persona_engine,
                 embedding_engine=embedding_engine,
+                memory_moment_store=memory_moment_store,
+                memory_node_store=memory_node_store,
                 now=chat_target,
             )
             if chat_result.get("status") not in {"disabled", "skipped"}:
@@ -1053,7 +1057,7 @@ class ReflectionEngine:
             if not item or item.get("id") in seen:
                 return False
             meta = item.get("metadata", {})
-            return meta.get("type") != "feel"
+            return meta.get("type") != "feel" and infer_bucket_layer(item) != LAYER_SOURCE_RECORD
 
         def add_candidate(item: dict | None) -> bool:
             if not eligible(item):
@@ -1461,6 +1465,8 @@ class ReflectionEngine:
         except Exception:
             all_buckets = []
         for bucket in all_buckets:
+            if infer_bucket_layer(bucket) == LAYER_SOURCE_RECORD:
+                continue
             meta = bucket.get("metadata", {})
             tags = {str(tag) for tag in meta.get("tags", [])}
             created = self._to_local(meta.get("created"))
@@ -2315,6 +2321,8 @@ class ReflectionEngine:
         raw_event_store=None,
         persona_engine=None,
         embedding_engine=None,
+        memory_moment_store=None,
+        memory_node_store=None,
         key: str = "",
         mode: str = "",
         force: bool = False,
@@ -2418,7 +2426,7 @@ class ReflectionEngine:
             window_summaries=window_summaries,
             max_candidates=max_candidates,
         )
-        if effective_mode == "review" and raw_candidates:
+        if raw_candidates:
             raw_candidates = await self._align_daily_chat_memory_candidate_sources(
                 key,
                 raw_candidates,
@@ -2430,7 +2438,7 @@ class ReflectionEngine:
             turns,
             max_candidates=max_candidates,
             min_confidence=min_confidence,
-            require_source_provenance=effective_mode == "review",
+            require_source_provenance=True,
         )
         if not candidates:
             return {
@@ -2466,6 +2474,8 @@ class ReflectionEngine:
             candidates,
             bucket_mgr,
             embedding_engine=embedding_engine,
+            memory_moment_store=memory_moment_store,
+            memory_node_store=memory_node_store,
         )
         cursor_updated = (
             self._update_daily_chat_memory_raw_cursor(profile_id, max_seen_raw_event_id, key)
@@ -3443,9 +3453,12 @@ class ReflectionEngine:
         bucket_mgr,
         *,
         embedding_engine=None,
+        memory_moment_store=None,
+        memory_node_store=None,
     ) -> dict:
         results = []
         created = exists = failed = 0
+        moment_indexed = node_indexed = index_failed = 0
         for candidate in candidates:
             bucket_id = str(candidate.get("id") or "").strip()
             if not bucket_id:
@@ -3457,9 +3470,27 @@ class ReflectionEngine:
                 failed += 1
                 results.append({"id": bucket_id, "status": "failed", "reason": "missing_content"})
                 continue
-            if await bucket_mgr.get(bucket_id):
+            existing_bucket = await bucket_mgr.get(bucket_id)
+            if existing_bucket:
                 exists += 1
-                results.append({"id": bucket_id, "status": "exists"})
+                index_errors = []
+                if memory_moment_store is not None:
+                    try:
+                        memory_moment_store.upsert_bucket(existing_bucket)
+                        moment_indexed += 1
+                    except Exception as exc:
+                        index_errors.append(f"moment:{type(exc).__name__}")
+                        logger.warning("Daily chat memory moment indexing failed for %s: %s", bucket_id, exc)
+                if memory_node_store is not None:
+                    try:
+                        memory_node_store.upsert_bucket(existing_bucket)
+                        node_indexed += 1
+                    except Exception as exc:
+                        index_errors.append(f"node:{type(exc).__name__}")
+                        logger.warning("Daily chat memory node indexing failed for %s: %s", bucket_id, exc)
+                if index_errors:
+                    index_failed += 1
+                results.append({"id": bucket_id, "status": "exists", "index_errors": index_errors})
                 continue
             key = str(candidate.get("date") or datetime.now(self.tz).date().isoformat())
             created_at = self._daily_chat_memory_created_at(key)
@@ -3490,22 +3521,47 @@ class ReflectionEngine:
                     },
                 )
                 created += 1
-                if embedding_engine and getattr(embedding_engine, "enabled", False):
+                bucket = await bucket_mgr.get(new_id)
+                index_errors = []
+                if bucket and embedding_engine and getattr(embedding_engine, "enabled", False):
                     try:
-                        bucket = await bucket_mgr.get(new_id)
-                        if bucket:
-                            await embedding_engine.generate_and_store(
-                                new_id,
-                                bucket_text_for_embedding(bucket),
-                            )
+                        await embedding_engine.generate_and_store(
+                            new_id,
+                            bucket_text_for_embedding(bucket),
+                        )
                     except Exception as exc:
+                        index_errors.append(f"embedding:{type(exc).__name__}")
                         logger.warning("Daily chat memory embedding failed for %s: %s", new_id, exc)
-                results.append({"id": new_id, "status": "created"})
+                if bucket and memory_moment_store is not None:
+                    try:
+                        memory_moment_store.upsert_bucket(bucket)
+                        moment_indexed += 1
+                    except Exception as exc:
+                        index_errors.append(f"moment:{type(exc).__name__}")
+                        logger.warning("Daily chat memory moment indexing failed for %s: %s", new_id, exc)
+                if bucket and memory_node_store is not None:
+                    try:
+                        memory_node_store.upsert_bucket(bucket)
+                        node_indexed += 1
+                    except Exception as exc:
+                        index_errors.append(f"node:{type(exc).__name__}")
+                        logger.warning("Daily chat memory node indexing failed for %s: %s", new_id, exc)
+                if index_errors:
+                    index_failed += 1
+                results.append({"id": new_id, "status": "created", "index_errors": index_errors})
             except Exception as exc:
                 failed += 1
                 logger.warning("Daily chat memory write failed for %s: %s", bucket_id, exc)
                 results.append({"id": bucket_id, "status": "failed", "reason": type(exc).__name__})
-        return {"created": created, "exists": exists, "failed": failed, "results": results}
+        return {
+            "created": created,
+            "exists": exists,
+            "failed": failed,
+            "moment_indexed": moment_indexed,
+            "node_indexed": node_indexed,
+            "index_failed": index_failed,
+            "results": results,
+        }
 
     def _store_daily_chat_memory_pending(self, candidates: list[dict], *, force: bool = False) -> dict:
         items = self._load_daily_chat_memory_pending()
@@ -3760,6 +3816,8 @@ class ReflectionEngine:
             return False
         for bucket in all_buckets:
             meta = bucket.get("metadata", {})
+            if infer_bucket_layer(bucket) == LAYER_SOURCE_RECORD:
+                continue
             if meta.get("type") == "feel" or meta.get("resolved") or meta.get("digested"):
                 continue
             if meta.get("source") == "reflection":

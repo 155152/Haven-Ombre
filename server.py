@@ -7296,6 +7296,7 @@ async def breath(
         unresolved = [
             b for b in all_buckets
             if not is_self_anchor_bucket(b)
+            and not _is_source_record_bucket(b)
             and not b["metadata"].get("resolved", False)
             and b["metadata"].get("type") not in ("permanent", "feel")
             and not b["metadata"].get("anchor", False)
@@ -9031,6 +9032,8 @@ async def daily_chat_memory_review(
             raw_event_store=raw_event_store,
             persona_engine=persona_engine,
             embedding_engine=embedding_engine,
+            memory_moment_store=memory_moment_store,
+            memory_node_store=memory_node_store,
             key=date_key,
             mode="review",
             force=bool(force),
@@ -9184,7 +9187,8 @@ async def introspection(
     # --- Filter: recent surface-level dynamic buckets (not permanent/pinned/feel) ---
     candidates = [
         b for b in all_buckets
-        if b["metadata"].get("type") not in ("permanent", "feel")
+        if not _is_source_record_bucket(b)
+        and b["metadata"].get("type") not in ("permanent", "feel")
         and not b["metadata"].get("pinned", False)
         and not b["metadata"].get("protected", False)
     ]
@@ -11577,6 +11581,8 @@ async def api_daily_chat_memory_run(request):
             raw_event_store=raw_event_store,
             persona_engine=persona_engine,
             embedding_engine=embedding_engine,
+            memory_moment_store=memory_moment_store,
+            memory_node_store=memory_node_store,
             key=str(body.get("date") or ""),
             mode=str(body.get("mode") or ""),
             force=_bool_value(body.get("force"), False),
@@ -13513,7 +13519,30 @@ if __name__ == "__main__":
             local_reflection_engine = ReflectionEngine(config)
             local_portrait_engine = DailyPortraitMaintainer(config)
             local_memory_edge_store = MemoryEdgeStore(config)
+            local_memory_moment_store = MemoryMomentStore(config)
+            local_memory_node_store = MemoryNodeStore(config)
             local_gateway_state_store = GatewayStateStore(os.path.join(config["buckets_dir"], "gateway_state.db"))
+            try:
+                existing_buckets = await local_bucket_mgr.list_all(include_archive=False)
+                daily_memory_buckets = [
+                    bucket
+                    for bucket in existing_buckets
+                    if (
+                        str((bucket.get("metadata") or {}).get("source") or "") == "daily_chat_memory"
+                        or bool((bucket.get("metadata") or {}).get("from_daily_chat"))
+                    )
+                ]
+                if daily_memory_buckets:
+                    moment_result = local_memory_moment_store.bulk_upsert(daily_memory_buckets)
+                    node_result = local_memory_node_store.bulk_upsert(daily_memory_buckets)
+                    logger.info(
+                        "Daily chat memory index reconciliation / 自动记忆索引对账: buckets=%d moments=%d nodes=%d",
+                        len(daily_memory_buckets),
+                        int(moment_result.get("moments") or 0),
+                        len(node_result),
+                    )
+            except Exception as exc:
+                logger.warning("Daily chat memory index reconciliation failed / 自动记忆索引对账失败: %s", exc)
             while True:
                 try:
                     reflection_cfg = config.get("reflection", {}) if isinstance(config.get("reflection", {}), dict) else {}
@@ -13590,6 +13619,8 @@ if __name__ == "__main__":
                         local_embedding_engine,
                         local_gateway_state_store,
                         raw_event_store,
+                        local_memory_moment_store,
+                        local_memory_node_store,
                     )
                     now_local = local_reflection_engine._local_now()
                     if (
