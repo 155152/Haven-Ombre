@@ -357,7 +357,7 @@ def test_daily_chat_provenance_filters_hallucinated_ids_and_derives_events():
     assert candidates[0]["source_event_ids"] == [102, 103]
 
 
-def test_review_candidate_without_source_turn_ids_is_rejected():
+def test_strict_candidate_without_source_ids_is_rejected():
     engine = ReflectionEngine(
         {
             "identity": {"ai_name": "夏以昼", "user_name": "32"},
@@ -432,8 +432,9 @@ def test_review_provenance_aligner_keeps_only_real_turn_ids(monkeypatch):
         )
         assert aligned[0]["source_turn_ids"] == [2]
         assert aligned[0]["source_event_ids"] == [102]
-        assert "source_turn_ids" not in aligned[1]
-        assert "source_event_ids" not in aligned[1]
+        assert aligned[1]["source_turn_ids"] == []
+        assert aligned[1]["source_event_ids"] == []
+        assert aligned[1]["provenance_status"] == "needs_repair"
 
     asyncio.run(scenario())
 
@@ -479,7 +480,8 @@ def test_review_provenance_aligner_maps_refs_to_raw_event_ids(monkeypatch):
                 {"id": None, "user_text": "u2", "assistant_text": "a2", "raw_event_ids": [102, 103]},
             ],
         )
-        assert "source_turn_ids" not in aligned[0]
+        assert aligned[0]["source_turn_ids"] == []
+        assert aligned[0]["provenance_status"] == "aligned"
         assert aligned[0]["source_event_ids"] == [101, 102, 103]
 
     asyncio.run(scenario())

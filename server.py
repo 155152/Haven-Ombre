@@ -11707,6 +11707,32 @@ async def api_daily_chat_memory_pending(request):
     return JSONResponse({"status": "ok", "items": items})
 
 
+@mcp.custom_route("/api/daily-chat-memory/repair", methods=["POST"])
+async def api_daily_chat_memory_repair(request):
+    """Manually repair pending evidence without confirming or writing memories."""
+    from starlette.responses import JSONResponse
+    err = _require_dashboard_auth(request)
+    if err:
+        return err
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid json body"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "json body must be an object"}, status_code=400)
+    ids = body.get("candidate_ids")
+    if not isinstance(ids, list) or not 1 <= len(ids) <= 20:
+        return JSONResponse({"error": "candidate_ids must contain 1 to 20 IDs"}, status_code=400)
+    result = await reflection_engine.repair_daily_chat_memory_provenance(
+        [str(value) for value in ids],
+        raw_event_store=raw_event_store,
+        conversation_turn_store=gateway_state_store,
+        persona_engine=persona_engine,
+        edits=body.get("edits") if isinstance(body.get("edits"), dict) else None,
+    )
+    return JSONResponse(result)
+
+
 @mcp.custom_route("/api/daily-chat-memory/confirm", methods=["POST"])
 async def api_daily_chat_memory_confirm(request):
     """Confirm or reject pending daily chat memory candidates."""

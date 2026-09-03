@@ -31,11 +31,15 @@
     return items.map(function (item) {
       var candidate = item.candidate || {};
       var id = item.id || '';
+      var needsRepair = candidate.provenance_status === 'needs_repair';
       return '<div class="chat-memory-card" data-candidate-id="' + escAttr(id) + '">' +
         '<strong>' + esc(candidate.title || id) + '</strong>' +
         '<div class="chat-memory-card-body">' + esc(candidate.content || '') + '</div>' +
         '<div class="chat-memory-card-meta">' +
           esc((candidate.kind || 'memory') + ' · ' + (item.date || '') + ' · confidence ' + (candidate.confidence || '')) +
+        '</div>' +
+        '<div class="chat-memory-card-meta">证据：' +
+          (needsRepair ? '待补齐 · needs_repair' : candidate.provenance_status === 'aligned' ? '已对齐 · aligned' : '历史候选') +
         '</div>' +
         '<div class="chat-memory-edit-panel" hidden>' +
           '<label class="chat-memory-edit-field">标题' +
@@ -64,7 +68,8 @@
         '</div>' +
         '<div class="chat-memory-card-actions">' +
           '<button type="button" onclick="toggleDailyChatMemoryEdit(this)">编辑</button>' +
-          '<button type="button" onclick="confirmDailyChatMemory(this, \'' + jsString(id) + '\', \'confirm\')">写入</button>' +
+          '<button type="button" onclick="repairDailyChatMemory(this, \'' + jsString(id) + '\')">补证据</button>' +
+          '<button type="button"' + (needsRepair ? ' disabled title="请先补齐证据"' : '') + ' onclick="confirmDailyChatMemory(this, \'' + jsString(id) + '\', \'confirm\')">写入</button>' +
           '<button type="button" class="danger" onclick="confirmDailyChatMemory(this, \'' + jsString(id) + '\', \'reject\')">拒绝</button>' +
         '</div>' +
       '</div>';
@@ -133,11 +138,41 @@
       if (!res) return;
       var data = await res.json();
       if (!res.ok) throw new Error(data.error || '操作失败');
+      if (!isReject && (data.results || []).some(function (result) { return result.status === 'blocked'; })) {
+        setDailyChatMemoryMessage('候选已保留，证据待补齐；请点击“补证据”后再写入。', 'error');
+        loadDailyChatMemoryPending();
+        return;
+      }
       setDailyChatMemoryMessage(isReject ? '已拒绝候选。' : '已写入候选。', 'ok');
       loadDailyChatMemoryPending();
       if (!isReject) loadBuckets();
     } catch (e) {
       setDailyChatMemoryMessage('操作失败: ' + e.message, 'error');
+    }
+  }
+
+  async function repairDailyChatMemory(button, id) {
+    button.disabled = true;
+    setDailyChatMemoryMessage('正在补齐证据，候选仍保留在待确认列表中…');
+    try {
+      var body = { candidate_ids: [id] };
+      var card = button.closest('.chat-memory-card');
+      if (card && card.getAttribute('data-editing') === 'true') {
+        body.edits = {};
+        body.edits[id] = readDailyChatMemoryEdits(card);
+      }
+      var res = await authFetch(dailyChatMemoryApiBase() + '/api/daily-chat-memory/repair', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+      });
+      if (!res) return;
+      var data = await res.json();
+      if (!res.ok) throw new Error(data.error || '补证据失败');
+      setDailyChatMemoryMessage(data.aligned ? '证据已补齐，等待你确认写入。' : '证据暂未补齐，候选已保留。', data.aligned ? 'ok' : 'error');
+      await loadDailyChatMemoryPending();
+    } catch (e) {
+      setDailyChatMemoryMessage('补证据失败，候选已保留：' + e.message, 'error');
+    } finally {
+      button.disabled = false;
     }
   }
 
@@ -149,6 +184,7 @@
   window.loadDailyChatMemoryPending = loadDailyChatMemoryPending;
   window.renderDailyChatMemoryPending = renderDailyChatMemoryPending;
   window.confirmDailyChatMemory = confirmDailyChatMemory;
+  window.repairDailyChatMemory = repairDailyChatMemory;
   window.toggleDailyChatMemoryEdit = toggleDailyChatMemoryEdit;
   window.initDailyChatMemoryTab = initDailyChatMemoryTab;
 

@@ -3,6 +3,8 @@ tests/
 !tests/
 tests/*
 !tests/test_memory_guards.py
+!tests/test_daily_chat_memory_review.py
+!tests/test_chat_memory_dashboard.cjs
 !tests/test_backfill_cyberboss_memory.py
 !tests/test_backfill_historical_llm_memory.py
 .chatgpt-historical-backfill/

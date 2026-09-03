@@ -212,7 +212,7 @@ DAILY_CHAT_MEMORY_PROVENANCE_PROMPT_TEMPLATE = """你是 Ombre 的 provenance �
 - source_turn_refs 只能复制 conversation_turns 里真实存在的 `turn_ref` 数字。
 - turn_ref 只是这次对齐调用里的临时编号；真正的 turn id / raw event id 会由 Ombre 代码映射，禁止你自己生成 provenance id。
 - 只选直接支撑该候选的 turns，不要因为在同一窗口就把整段都挂上。
-- 如果某条候选找不到直接证据，给空数组；后续系统会 fail-closed，不写这条候选。
+- 如果某条候选找不到直接证据，给空数组；review 会保留待补证据候选，auto 不会写入。
 - 只输出紧凑 JSON，不要 Markdown 或解释。
 
 输出：
@@ -1012,7 +1012,7 @@ class ReflectionEngine:
                 memory_node_store=memory_node_store,
                 now=chat_target,
             )
-            if chat_result.get("status") not in {"disabled", "skipped"}:
+            if chat_result.get("status") not in {"disabled", "skipped"} or chat_result.get("reason") == "no_candidates":
                 results.append(chat_result)
             chat_candidates = [
                 item for item in (chat_result.get("candidates") or []) if isinstance(item, dict)
@@ -1898,6 +1898,8 @@ class ReflectionEngine:
     def _daily_chat_memory_material(self, candidate: dict) -> dict:
         if not isinstance(candidate, dict):
             return {}
+        if candidate.get("provenance_status") == "needs_repair":
+            return {}
         content = re.sub(
             r"\s+",
             " ",
@@ -2426,6 +2428,7 @@ class ReflectionEngine:
             window_summaries=window_summaries,
             max_candidates=max_candidates,
         )
+        extracted_count = len(raw_candidates)
         if raw_candidates:
             raw_candidates = await self._align_daily_chat_memory_candidate_sources(
                 key,
@@ -2438,8 +2441,16 @@ class ReflectionEngine:
             turns,
             max_candidates=max_candidates,
             min_confidence=min_confidence,
-            require_source_provenance=True,
+            require_source_provenance=effective_mode != "review",
         )
+        diagnostics = {
+            "extracted": extracted_count,
+            "retained": len(candidates),
+            "filtered": extracted_count - len(candidates),
+            "aligned": sum(c.get("provenance_status") == "aligned" for c in candidates),
+            "needs_repair": sum(c.get("provenance_status") == "needs_repair" for c in candidates),
+        }
+        logger.info("Daily chat memory review/extraction: date=%s mode=%s counts=%s", key, effective_mode, diagnostics)
         if not candidates:
             return {
                 "status": "skipped",
@@ -2448,9 +2459,21 @@ class ReflectionEngine:
                 "mode": effective_mode,
                 "turns": len(turns),
                 "window_summaries": len(window_summaries),
+                "diagnostics": diagnostics,
             }
 
         if effective_mode == "review":
+            # Retrieval scope is not evidence. Keep exact input IDs separately so a
+            # later repair cannot silently expand to another window or profile.
+            provenance_context = {
+                "profile_id": profile_id,
+                "date": key,
+                "turn_source": turn_source,
+                "input_event_ids": sorted({int(e) for t in turns for e in (t.get("raw_event_ids") or [])}),
+                "input_turn_ids": [int(t["id"]) for t in turns if t.get("id") is not None],
+            }
+            for candidate in candidates:
+                candidate["provenance_context"] = provenance_context
             pending = self._store_daily_chat_memory_pending(candidates, force=force)
             cursor_updated = (
                 self._update_daily_chat_memory_raw_cursor(profile_id, max_seen_raw_event_id, key)
@@ -2466,6 +2489,7 @@ class ReflectionEngine:
                 "window_summaries": len(window_summaries),
                 "last_raw_event_id": max_seen_raw_event_id or raw_event_cursor_id,
                 "cursor_updated": cursor_updated,
+                "diagnostics": diagnostics,
                 "candidates": candidates,
                 **pending,
             }
@@ -2571,6 +2595,78 @@ class ReflectionEngine:
             items = [item for item in items if str(item.get("status") or "") == safe_status]
         items.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
         return items[:safe_limit]
+
+    async def repair_daily_chat_memory_provenance(
+        self,
+        candidate_ids: list[str],
+        *,
+        raw_event_store=None,
+        conversation_turn_store=None,
+        persona_engine=None,
+        edits: dict[str, dict] | None = None,
+    ) -> dict:
+        """Explicitly repair pending evidence only; never write buckets or advance cursors."""
+        profile_id = str(getattr(persona_engine, "profile_id", "") or "default")
+        results = []
+        for candidate_id in dict.fromkeys(str(value) for value in candidate_ids):
+            items = self._load_daily_chat_memory_pending()
+            item = next((row for row in items if row.get("id") == candidate_id), None)
+            if not item or item.get("status") != "pending":
+                results.append({"id": candidate_id, "status": "skipped", "reason": "not_pending"})
+                continue
+            original = dict(item.get("candidate") or {})
+            context = original.get("provenance_context") or {}
+            if not context or context.get("profile_id") != profile_id:
+                results.append({"id": candidate_id, "status": "skipped", "reason": "repair_scope_unavailable"})
+                continue
+            candidate = self._apply_daily_chat_memory_candidate_edit(original, (edits or {}).get(candidate_id))
+            if candidate.get("provenance_status") == "aligned" and candidate == original:
+                results.append({"id": candidate_id, "status": "aligned"})
+                continue
+            candidate = {**candidate, "provenance_status": "needs_repair",
+                         "source_turn_ids": [], "source_event_ids": []}
+            try:
+                key = str(context["date"])
+                start, end = self._period_window("daily", self._daily_chat_memory_target(key))
+                turns = []
+                if context.get("turn_source") == "raw_events" and raw_event_store:
+                    allowed = set(context.get("input_event_ids") or [])
+                    events = raw_event_store.list_events_between(start_at=start, end_at=end, limit=0)
+                    events = [event for event in events if event.get("id") in allowed
+                              and str((event.get("metadata") or {}).get("profile_id") or profile_id) == profile_id]
+                    if allowed and {event["id"] for event in events} == allowed:
+                        turns = self._raw_event_turn_payloads(events, limit=0)
+                elif context.get("turn_source") == "conversation_turns" and conversation_turn_store:
+                    allowed = set(context.get("input_turn_ids") or [])
+                    rows = conversation_turn_store.list_conversation_turns_between(
+                        profile_id=profile_id, start_at=start, end_at=end, limit=80,
+                    )
+                    rows = [row for row in rows if row.get("id") in allowed]
+                    if allowed and {row["id"] for row in rows} == allowed:
+                        turns = self._conversation_turn_payloads(rows, limit=0)
+                if turns:
+                    candidate = (await self._align_daily_chat_memory_candidate_sources(key, [candidate], turns))[0]
+                else:
+                    candidate["provenance_error"] = "repair_input_unavailable"
+            except Exception as exc:
+                logger.warning("Daily chat memory repair failed: %s", type(exc).__name__)
+                candidate["provenance_error"] = "repair_failed"
+
+            # Alignment awaits a model. Reload instead of overwriting a rejection,
+            # edit, new candidate or cursor change made while that call ran.
+            latest = self._load_daily_chat_memory_pending()
+            current = next((row for row in latest if row.get("id") == candidate_id), None)
+            if not current or current.get("status") != "pending" or current.get("candidate") != original:
+                results.append({"id": candidate_id, "status": "skipped", "reason": "candidate_changed"})
+                continue
+            current["candidate"] = candidate
+            current["provenance_last_attempt_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            self._save_daily_chat_memory_pending(latest)
+            results.append({"id": candidate_id, "status": candidate["provenance_status"],
+                            "reason": candidate.get("provenance_error", "")})
+        return {"status": "ok", "results": results,
+                "aligned": sum(row["status"] == "aligned" for row in results),
+                "needs_repair": sum(row["status"] == "needs_repair" for row in results)}
 
     async def confirm_daily_chat_memory(
         self,
@@ -2695,11 +2791,20 @@ class ReflectionEngine:
         candidates: list[dict],
         turns: list[dict],
     ) -> list[dict]:
+        # Extraction output is never trusted as provenance, even if the model
+        # ignored its prompt and supplied IDs. Only this alignment may add them.
+        candidates = [
+            {**candidate, "source_turn_ids": [], "source_event_ids": [],
+             "provenance_status": "needs_repair", "provenance_error": "no_matching_evidence"}
+            for candidate in candidates
+        ]
         if not candidates or not turns:
             return candidates
         client, model, use_daily_client = self._daily_chat_memory_model_client(candidate=True)
         if not client:
             logger.warning("Daily chat memory provenance alignment skipped: model unavailable")
+            for candidate in candidates:
+                candidate["provenance_error"] = "model_unavailable"
             return candidates
 
         compact_candidates = [
@@ -2743,9 +2848,13 @@ class ReflectionEngine:
             alignments = parsed.get("alignments") if isinstance(parsed, dict) else []
         except Exception as exc:
             logger.warning("Daily chat memory provenance alignment failed: %s", exc)
+            for candidate in candidates:
+                candidate["provenance_error"] = "alignment_failed"
             return candidates
         if not isinstance(alignments, list):
             logger.warning("Daily chat memory provenance alignment invalid payload")
+            for candidate in candidates:
+                candidate["provenance_error"] = "invalid_payload"
             return candidates
 
         allowed_turn_refs = set(turns_by_ref)
@@ -2759,6 +2868,10 @@ class ReflectionEngine:
             except (TypeError, ValueError):
                 continue
             if index < 0 or index >= len(aligned):
+                continue
+            raw_refs = item.get("source_turn_refs")
+            if not isinstance(raw_refs, list) or len(raw_refs) > 4:
+                aligned[index]["provenance_error"] = "invalid_reference_count"
                 continue
             turn_refs = list(dict.fromkeys(
                 int(turn_ref)
@@ -2778,13 +2891,18 @@ class ReflectionEngine:
                 for turn in matched_turns
                 for event_id in (turn.get("raw_event_ids") or [])
                 if event_id is not None and str(event_id).isdigit()
-            ))[:80]
+            ))
+            if len(source_event_ids) > 10:
+                aligned[index]["provenance_error"] = "too_many_source_events"
+                continue
             if not source_turn_ids and not source_event_ids:
                 continue
             if source_turn_ids:
                 aligned[index]["source_turn_ids"] = source_turn_ids
             if source_event_ids:
                 aligned[index]["source_event_ids"] = source_event_ids
+            aligned[index]["provenance_status"] = "aligned"
+            aligned[index].pop("provenance_error", None)
             aligned_count += 1
         logger.info(
             "Daily chat memory provenance alignment: candidates=%d aligned=%d",
@@ -3338,22 +3456,31 @@ class ReflectionEngine:
                 for event_id in self._string_list(candidate.get("source_event_ids"), limit=80)
                 if str(event_id).isdigit() and int(event_id) in allowed_raw_event_ids
             ))
-            if require_source_provenance and not requested_turn_ids and not requested_event_ids:
-                drop("missing_source_provenance")
-                continue
             if requested_turn_ids:
                 source_turn_ids = requested_turn_ids
                 source_event_ids = list(dict.fromkeys(
                     event_id
                     for turn_id in requested_turn_ids
                     for event_id in raw_event_ids_by_turn.get(turn_id, [])
-                ))[:80]
+                ))
             elif requested_event_ids:
                 source_turn_ids = []
                 source_event_ids = requested_event_ids
             else:
-                source_turn_ids = fallback_turn_ids[:20]
-                source_event_ids = fallback_raw_event_ids[:80]
+                source_turn_ids = []
+                source_event_ids = []
+            provenance_error = str(candidate.get("provenance_error") or "missing_source_provenance")
+            if candidate.get("provenance_status") == "needs_repair":
+                source_turn_ids, source_event_ids = [], []
+            if (len(source_turn_ids) > 4 or len(source_event_ids) > 10
+                    or len(candidate.get("source_event_ids") or []) > 10
+                    or len(candidate.get("source_turn_ids") or []) > 4):
+                source_turn_ids, source_event_ids = [], []
+                provenance_error = "too_many_source_references"
+            aligned = bool(source_turn_ids or source_event_ids)
+            if require_source_provenance and not aligned:
+                drop(provenance_error)
+                continue
             item = self._daily_chat_memory_enrich_candidate_terms({
                 "id": self._daily_chat_memory_candidate_id(key, kind, content),
                 "date": key,
@@ -3369,6 +3496,8 @@ class ReflectionEngine:
                 "confidence": confidence,
                 "source_turn_ids": source_turn_ids,
                 "source_event_ids": source_event_ids,
+                "provenance_status": "aligned" if aligned else "needs_repair",
+                **({"provenance_error": provenance_error} if not aligned else {}),
                 "reason": str(candidate.get("reason") or "").strip()[:160],
             })
             if self._daily_chat_memory_duplicate_candidate(item, normalized):
@@ -3377,7 +3506,7 @@ class ReflectionEngine:
             normalized.append(item)
             if len(normalized) >= int(max_candidates or self.daily_chat_memory_max_per_day or 1):
                 break
-        logger.debug(
+        logger.info(
             "Daily chat memory normalization: raw=%d normalized=%d drops=%s",
             len(candidates or []),
             len(normalized),
@@ -3432,6 +3561,11 @@ class ReflectionEngine:
             updated["confidence"] = self._clamp(edit.get("confidence"))
         if "reason" in edit:
             updated["reason"] = re.sub(r"\s+", " ", str(edit.get("reason") or "").strip())[:160]
+        if candidate.get("provenance_status") and any(
+            updated.get(field) != candidate.get(field) for field in ("content", "title", "kind")
+        ):
+            updated.update(provenance_status="needs_repair", provenance_error="candidate_edited",
+                           source_turn_ids=[], source_event_ids=[])
         return self._daily_chat_memory_enrich_candidate_terms(updated)
 
     @staticmethod
@@ -3461,6 +3595,10 @@ class ReflectionEngine:
         moment_indexed = node_indexed = index_failed = 0
         for candidate in candidates:
             bucket_id = str(candidate.get("id") or "").strip()
+            if candidate.get("provenance_status") == "needs_repair":
+                failed += 1
+                results.append({"id": bucket_id, "status": "blocked", "reason": "provenance_needs_repair"})
+                continue
             if not bucket_id:
                 failed += 1
                 results.append({"id": "", "status": "failed", "reason": "missing_candidate_id"})
