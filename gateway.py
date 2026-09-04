@@ -2212,12 +2212,14 @@ class GatewayService:
             dict.fromkeys(str(item or "").strip() for item in raw_ids if str(item or "").strip())
         )[:20]
         recent_context_injected = bool(body.get("recent_context_injected"))
+        feedback = body.get("feedback") if isinstance(body.get("feedback"), list) else []
         try:
             result = self.state_store.record_hook_completion(
                 session_id,
                 turn_id,
                 recalled_ids,
                 recent_context_injected=recent_context_injected,
+                feedback=feedback,
             )
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
@@ -2230,6 +2232,7 @@ class GatewayService:
                 "round_id": int(result.get("round_id") or 0),
                 "recent_context_injected": recent_context_injected,
                 "recalled_ids": recalled_ids,
+                "feedback_count": int(result.get("feedback_count") or 0),
             }
         )
 
@@ -2319,6 +2322,14 @@ class GatewayService:
             floor=400,
             ceiling=12000,
         )
+        current_turn_id = str(body.get("current_turn_id") or "").strip()
+        current_source_event_id = str(body.get("current_source_event_id") or "").strip()
+        focused_full = self._truthy_header(
+            str(body.get("focused_full")) if body.get("focused_full") is not None else None
+        )
+        admission_mode = str(body.get("admission_mode") or "").strip().lower()
+        if admission_mode not in {"none", "light", "full"}:
+            admission_mode = "full" if recall_mode == "full" else "light"
 
         if recall_mode == "full":
             return await self._handle_hook_recall_full(
@@ -2332,6 +2343,9 @@ class GatewayService:
                 include_diffused=include_diffused,
                 include_context_debug=include_context_debug,
                 include_debug=include_debug,
+                current_turn_id=current_turn_id,
+                current_source_event_id=current_source_event_id,
+                focused_full=focused_full,
             )
 
         try:
@@ -2345,6 +2359,7 @@ class GatewayService:
                 allow_query_planner=allow_query_planner,
                 allow_semantic_session_dedupe=allow_semantic_session_dedupe,
                 allow_rerank=allow_rerank,
+                admission_mode=admission_mode,
             )
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
@@ -2402,8 +2417,107 @@ class GatewayService:
         include_diffused: bool,
         include_context_debug: bool,
         include_debug: bool,
+        current_turn_id: str = "",
+        current_source_event_id: str = "",
+        focused_full: bool = False,
     ) -> JSONResponse:
         """Run the normal Gateway recall pipeline without forwarding upstream."""
+        if focused_full:
+            try:
+                all_buckets = await self._list_gateway_buckets(include_archive=False)
+                direct_candidates = [
+                    bucket
+                    for bucket in all_buckets
+                    if self._hook_bucket_has_strong_topic_evidence(
+                        query,
+                        bucket,
+                        allow_signal=False,
+                    )
+                ]
+                direct_candidates.sort(
+                    key=lambda bucket: self._hook_focused_bucket_rank(query, bucket),
+                    reverse=True,
+                )
+                focused_cards: list[dict[str, Any]] = []
+                focused_ids: list[str] = []
+                for bucket in direct_candidates:
+                    card = self._hook_recall_card_from_bucket(
+                        bucket,
+                        query=query,
+                        max_chars=max_chars,
+                    )
+                    if not card:
+                        continue
+                    bucket_id = str(card.get("bucket_id") or "")
+                    if not bucket_id:
+                        continue
+                    focused_cards = [card]
+                    focused_ids = [bucket_id]
+                    break
+                focused_debug = {
+                    "hook_recall_debug": {
+                        "mode": "focused_direct_bucket",
+                        "candidate_count": len(direct_candidates),
+                        "direct_scan_hit": bool(focused_cards),
+                    }
+                }
+                if not focused_cards:
+                    focused_cards, focused_ids, focused_debug = await self._hook_recall_fast_cards(
+                        query,
+                        session_id,
+                        max_cards=min(1, max_cards),
+                        max_chars=max_chars,
+                        include_diffused=False,
+                        allow_semantic=True,
+                        allow_query_planner=True,
+                        allow_semantic_session_dedupe=True,
+                        allow_rerank=False,
+                        admission_mode="full",
+                        require_direct_topic=True,
+                    )
+            except ValueError as exc:
+                return JSONResponse({"error": str(exc)}, status_code=400)
+            except RuntimeError as exc:
+                return JSONResponse({"error": str(exc)}, status_code=503)
+            if focused_cards:
+                dynamic_context = self._clip_text(
+                    self._hook_recall_full_dynamic_context(
+                        {},
+                        include_diffused=False,
+                        cards=focused_cards,
+                    ),
+                    max_context_chars,
+                )
+                additional_context = self._render_hook_recall_full_additional_context(dynamic_context)
+                hook_debug = (focused_debug or {}).get("hook_recall_debug") or {}
+                minimal_debug = {
+                    "mode": "full_focused",
+                    "query": query,
+                    "candidate_count": int(hook_debug.get("candidate_count") or len(focused_cards)),
+                    "recalled_bucket_ids": list(focused_ids or []),
+                    "diffused_bucket_ids": [],
+                    "just_now_context_injected": False,
+                    "date_recall_injected": False,
+                    "recent_context_injected": False,
+                    "recent_context_reason": "",
+                    "focused_full_hit": True,
+                    "prepare_timing_debug": {},
+                }
+                response: dict[str, Any] = {
+                    "ok": True,
+                    "query": query,
+                    "session_id": session_id,
+                    "cards": focused_cards,
+                    "notes": focused_cards,
+                    "additional_context": additional_context,
+                    "recalled_ids": list(focused_ids or []),
+                    "debug": minimal_debug,
+                }
+                if include_debug:
+                    debug = dict(focused_debug or {})
+                    response["debug"] = {**debug, **minimal_debug}
+                return JSONResponse(response)
+
         try:
             _forward_payload, recalled_ids, debug_payload = await self.prepare_payload(
                 {
@@ -2414,6 +2528,7 @@ class GatewayService:
                 session_id,
                 include_debug=True,
                 debug_detail="compact",
+                excluded_raw_source_event_ids={current_source_event_id} if current_source_event_id else None,
             )
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
@@ -2430,6 +2545,7 @@ class GatewayService:
             self._hook_recall_full_dynamic_context(
                 debug_payload,
                 include_diffused=include_diffused,
+                cards=cards,
             ),
             max_context_chars,
         )
@@ -2447,6 +2563,7 @@ class GatewayService:
             "recent_context_injected": bool(debug_payload.get("recent_context_injected")),
             "recent_context_reason": str(debug_payload.get("recent_context_reason") or ""),
             "prepare_timing_debug": dict(debug_payload.get("prepare_timing_debug") or {}),
+            "focused_full_hit": False,
         }
         response: dict[str, Any] = {
             "ok": True,
@@ -2678,6 +2795,7 @@ class GatewayService:
         include_debug: bool = False,
         manage_turn_snapshot: bool = False,
         debug_detail: str = "full",
+        excluded_raw_source_event_ids: set[str] | None = None,
     ) -> tuple[dict, list[str] | None] | tuple[dict, list[str] | None, dict[str, Any]]:
         prepare_started_at = time.perf_counter()
         prepare_steps_ms: dict[str, int] = {}
@@ -2868,6 +2986,7 @@ class GatewayService:
                 date_recall, date_recall_debug, date_recall_bucket_ids = self._build_date_recall_context(
                     current_user_query,
                     all_buckets,
+                    excluded_raw_source_event_ids=excluded_raw_source_event_ids,
                 )
                 mark_step("date_recall", stage_started_at)
             elif sentinel_skip_broad:
@@ -7959,6 +8078,8 @@ class GatewayService:
         self,
         query_text: str,
         all_buckets: list[dict],
+        *,
+        excluded_raw_source_event_ids: set[str] | None = None,
     ) -> tuple[str, dict[str, Any], list[str]]:
         debug = self._date_recall_debug_base(query_text)
         debug["triggered"] = True
@@ -7983,6 +8104,7 @@ class GatewayService:
             end_at,
             topic_terms,
             match_assistant_text=role_safe_transcript_required,
+            excluded_raw_source_event_ids=excluded_raw_source_event_ids,
         )
         exact_phrase_raw_hit = bool(turns) and bool(protected_phrases)
         include_buckets = (
@@ -8056,12 +8178,14 @@ class GatewayService:
         topic_terms: list[str],
         *,
         match_assistant_text: bool = False,
+        excluded_raw_source_event_ids: set[str] | None = None,
     ) -> tuple[list[dict[str, Any]], str]:
         raw_turns = self._date_recall_raw_turns_for_range(
             start_at,
             end_at,
             topic_terms,
             match_assistant_text=match_assistant_text,
+            excluded_raw_source_event_ids=excluded_raw_source_event_ids,
         )
         if raw_turns:
             return raw_turns[: self.date_recall_max_turns], "raw_events"
@@ -8094,8 +8218,12 @@ class GatewayService:
         topic_terms: list[str],
         *,
         match_assistant_text: bool = False,
+        excluded_raw_source_event_ids: set[str] | None = None,
     ) -> list[dict[str, Any]]:
-        limit = max(self.date_recall_max_turns * 12, self.date_recall_max_turns * 4, 80)
+        # Scan a broad same-day window before topic filtering. The previous
+        # small pre-filter LIMIT could drop an older relevant turn after a
+        # busy day accumulated many newer raw events.
+        limit = max(self.date_recall_max_turns * 64, 512)
         try:
             raw_events = self.raw_event_store.list_events_between(
                 start_at=start_at,
@@ -8107,8 +8235,15 @@ class GatewayService:
         if not raw_events:
             return []
 
+        excluded_ids = {
+            str(value or "").strip()
+            for value in (excluded_raw_source_event_ids or set())
+            if str(value or "").strip()
+        }
         grouped: dict[tuple[str, str], dict[str, Any]] = {}
         for event in raw_events:
+            if str(event.get("source_event_id") or "").strip() in excluded_ids:
+                continue
             metadata = event.get("metadata", {}) if isinstance(event.get("metadata"), dict) else {}
             session_id = str(event.get("session_id") or event.get("conversation_id") or "")
             round_value = metadata.get("round_id")
@@ -8221,16 +8356,50 @@ class GatewayService:
         )
         if plain_today_status:
             return False
-        if any(marker in text for marker in DATE_RECALL_CHAT_MARKERS):
-            return True
-        return self._query_has_explicit_date_topic(text)
+        return self._query_has_date_recall_lookup_intent(text)
 
-    def _query_has_explicit_date_topic(self, query: str) -> bool:
+    def _query_has_date_recall_lookup_intent(self, query: str) -> bool:
         text = str(query or "").strip()
-        hint = self._query_date_recall_hint(text)
-        if not hint:
+        if not text:
             return False
-        return bool(self._date_recall_protected_topic_terms(text))
+        compact = self._compact_lookup_key(text)
+        if not compact:
+            return False
+        explicit_markers = (
+            "还记得",
+            "记不记得",
+            "记得",
+            "回忆",
+            "说过",
+            "聊过",
+            "提过",
+            "讲过",
+            "讨论过",
+            "发生了什么",
+            "发生什么",
+            "发生过什么",
+            "做了什么",
+            "什么事",
+            "怎么回事",
+            "怎么说",
+            "为什么",
+            "有没有",
+            "是否",
+            "哪次",
+            "哪件",
+            "谁",
+        )
+        if any(self._compact_lookup_key(marker) in compact for marker in explicit_markers):
+            return True
+        if any(marker in text for marker in ("?", "？", "吗")) and any(
+            marker in text for marker in DATE_RECALL_CHAT_MARKERS
+        ):
+            return True
+        terse_event_reference = self._compact_lookup_key(strip_human_date_references(text)).strip("的")
+        return bool(
+            len(terse_event_reference) <= 8
+            and any(marker in terse_event_reference for marker in ("事", "那次", "这次", "事情"))
+        )
 
     def _query_requires_role_safe_date_transcript(self, query: str) -> bool:
         compact = self._compact_lookup_key(query)
@@ -8256,7 +8425,11 @@ class GatewayService:
         topic_query = self._strip_date_recall_query_shell(query)
         if not topic_query:
             return []
+        locatable_terms = list(self.recall_policy.locatable_query_terms(topic_query))
+        if len(locatable_terms) >= 2:
+            return self._dedupe_date_recall_topic_terms(locatable_terms)
         terms = list(self.recall_policy.specific_query_terms(topic_query))
+        terms.extend(locatable_terms)
         terms.extend(re.findall(r"[A-Za-z]+[A-Za-z0-9_.:-]*|[\u4e00-\u9fff]{2,}", topic_query))
         expanded = expanded_terms_for_query(topic_query, self.relevance_options)
         if re.search(r"[\u4e00-\u9fff]", topic_query):
@@ -8278,7 +8451,11 @@ class GatewayService:
 
     def _strip_date_recall_query_shell(self, query: str) -> str:
         text = strip_human_date_references(query)
-        shell_terms = date_recall_shell_terms(self.identity) | DATE_RECALL_ROLE_QUERY_SHELL_TERMS
+        shell_terms = (
+            date_recall_shell_terms(self.identity)
+            | DATE_RECALL_ROLE_QUERY_SHELL_TERMS
+            | {"凌晨", "清晨", "早晨", "早上", "上午", "中午", "下午", "傍晚", "晚上"}
+        )
         for term in sorted(shell_terms, key=lambda item: len(str(item)), reverse=True):
             if str(term).strip():
                 text = text.replace(str(term), " ")
@@ -8286,7 +8463,12 @@ class GatewayService:
 
     @staticmethod
     def _dedupe_date_recall_topic_terms(terms: list[str]) -> list[str]:
-        stop = {"工作吗", "状态", "怎么样", "如何", "知道", "当前", "现在", "最近", "career"}
+        stop = {
+            "工作吗", "状态", "怎么样", "如何", "知道", "当前", "现在", "最近", "career",
+            "今天", "昨天", "明天", "前天", "后天", "今早", "明早", "昨晚", "今晚",
+            "今天早上", "昨天早上", "明天早上", "早上", "上午", "中午", "下午", "晚上",
+            "希望", "等等", "再等等", "回来", "回来啦",
+        }
         candidates = []
         seen = set()
         for index, term in enumerate(terms or []):
@@ -8312,7 +8494,21 @@ class GatewayService:
         if not topic_terms:
             return True
         haystack = self._compact_lookup_key(text)
-        return any(self._compact_lookup_key(term) in haystack for term in topic_terms if self._compact_lookup_key(term))
+        terms = [
+            self._compact_lookup_key(term)
+            for term in topic_terms
+            if self._compact_lookup_key(term)
+        ]
+        if not terms:
+            return True
+        matched = [term for term in terms if term in haystack]
+        if not matched:
+            return False
+        if len(terms) == 1:
+            return True
+        if any(len(term) >= 4 for term in matched):
+            return True
+        return len(set(matched)) >= 2
 
     def _date_recall_bucket_text(self, bucket: dict) -> str:
         meta = bucket.get("metadata", {}) if isinstance(bucket.get("metadata"), dict) else {}
@@ -10504,19 +10700,43 @@ class GatewayService:
             reliability = "diffused_association"
         else:
             reliability = self._reading_note_reliability(moment, direct_evidence, strong_evidence)
+        usage_mode, mention_policy = self._memory_usage_policy(
+            query_text,
+            kind=kind,
+            source=source,
+        )
 
         return {
             "use": "standard",
             "why": "Gateway selected this memory for the current message.",
             "reliability": reliability,
-            "mention_policy": "standard",
+            "usage_mode": usage_mode,
+            "mention_policy": mention_policy,
             "conflict_rule": "current_user_message_wins",
             "canonical_domain": canonical_domain,
             "domain_parent": domain_parent,
             "kind": kind,
             "status_view": status_view,
+            "stability_class": str(view.get("stability_class") or "phase"),
+            "validity_state": str(view.get("validity_state") or "current"),
             "flags": flags,
         }
+
+    @staticmethod
+    def _memory_usage_policy(query_text: str, *, kind: str = "", source: str = "direct") -> tuple[str, str]:
+        text = str(query_text or "").strip().lower()
+        explicit_markers = (
+            "还记得", "记不记得", "回忆", "记忆", "之前", "以前", "上次", "那次",
+            "当时", "曾经", "第一次", "说过", "聊过", "提过", "发生过", "发生了什么",
+            "做了什么", "怎么回事", "哪次", "什么时候", "remember", "recall", "memory",
+        )
+        if any(marker in text for marker in explicit_markers):
+            return "explicit", "allowed_when_answering_memory_request"
+        if str(source or "") == "diffused":
+            return "silent", "never_mention_unless_user_asks"
+        if str(kind or "") in {"preference", "profile_fact"}:
+            return "implicit", "use_naturally_without_citing_memory"
+        return "silent", "never_mention_unless_user_asks"
 
     @staticmethod
     def _query_requests_memory_reason(query_text: str) -> bool:
@@ -10595,9 +10815,13 @@ class GatewayService:
         }
 
     def _format_reading_note_line(self, note: dict[str, Any]) -> str:
+        usage_mode = str((note or {}).get("usage_mode") or "silent")
+        mention_policy = str((note or {}).get("mention_policy") or "never_mention_unless_user_asks")
         return (
             "reading_note: Use only if directly helpful; ignore if irrelevant or conflicting. "
-            "Do not mechanically repeat or mention retrieval."
+            f"usage_mode={usage_mode}; mention_policy={mention_policy}. "
+            "silent means shape tone/judgment without surfacing the memory; implicit means use it naturally without citing memory; "
+            "explicit may be stated only when it directly answers the user's memory request."
         )
 
     def _insert_reading_note_after_header(self, block: str, note: dict[str, Any]) -> str:
@@ -15614,6 +15838,7 @@ class GatewayService:
         candidate_ids |= set(entity_edge_boosts)
         if not candidate_ids:
             return [], []
+        feedback_profiles = self.state_store.get_recall_feedback_profiles(candidate_ids)
 
         stage_started_at = time.perf_counter()
         semantic_norms = self._normalized_score_map(semantic_scores)
@@ -15756,6 +15981,19 @@ class GatewayService:
                 or dynamic_anchor.get("category_overview_item")
             ):
                 final_score = max(final_score, self.first_card_min_score)
+            stability = self._memory_stability_payload(bucket, raw_query_plan)
+            feedback_profile = dict(feedback_profiles.get(bucket_id) or {})
+            feedback_multiplier = self._safe_float(feedback_profile.get("multiplier"), 1.0)
+            if bool(getattr(raw_query_plan, "explicit_old_memory", False)):
+                feedback_multiplier = max(0.85, feedback_multiplier)
+            final_score = round(
+                self._clamp(
+                    final_score
+                    * self._safe_float(stability.get("multiplier"), 1.0)
+                    * feedback_multiplier
+                ),
+                4,
+            )
             scored_candidates.append(
                 {
                     "bucket": bucket,
@@ -15807,6 +16045,11 @@ class GatewayService:
                     "metadata_adjustment": metadata_adjustment,
                     "word_map_adjustment": word_map_adjustment,
                     "cooldown_penalty": cooldown_penalty,
+                    "stability_class": str(stability.get("stability_class") or "phase"),
+                    "validity_state": str(feedback_profile.get("validity_state") or stability.get("validity_state") or "current"),
+                    "stability_multiplier": self._safe_float(stability.get("multiplier"), 1.0),
+                    "feedback_multiplier": feedback_multiplier,
+                    "feedback_profile": feedback_profile,
                     "dynamic_alpha_debug": alpha_debug if self.recall_fusion_mode == "dynamic" else {},
                     "planner_lexical_match": lexical_match,
                     "planner_lexical_direct_match": planner_lexical_direct_match,
@@ -16243,6 +16486,11 @@ class GatewayService:
                 "dynamic_alpha_confidence",
                 "metadata_adjustment",
                 "cooldown_penalty",
+                "stability_class",
+                "validity_state",
+                "stability_multiplier",
+                "feedback_multiplier",
+                "feedback_profile",
                 "admission_reason",
                 "matched_query_terms",
                 "recall_policy_debug",
@@ -19257,6 +19505,8 @@ class GatewayService:
         allow_query_planner: bool,
         allow_semantic_session_dedupe: bool,
         allow_rerank: bool,
+        admission_mode: str = "light",
+        require_direct_topic: bool = False,
     ) -> tuple[list[dict[str, Any]], list[str], dict[str, Any]]:
         memory_sentinel_debug = self._memory_sentinel_debug_base(query)
         memory_sentinel_debug["searchable_residue_terms"] = self._memory_sentinel_searchable_residue_terms(query)
@@ -19338,6 +19588,35 @@ class GatewayService:
             selected_buckets,
             all_buckets,
         )
+        topic_suppressed_bucket_ids: list[str] = []
+        if admission_mode in {"light", "full"}:
+            if require_direct_topic:
+                selected_ids = {str((bucket or {}).get("id") or "") for bucket in selected_buckets}
+                direct_candidates = [
+                    bucket
+                    for bucket in all_buckets
+                    if str((bucket or {}).get("id") or "") not in selected_ids
+                    and self._hook_bucket_has_strong_topic_evidence(query, bucket, allow_signal=False)
+                ]
+                selected_buckets = [*selected_buckets, *direct_candidates]
+            kept_buckets: list[dict[str, Any]] = []
+            for bucket in selected_buckets:
+                if self._hook_bucket_has_strong_topic_evidence(
+                    query,
+                    bucket,
+                    allow_signal=not require_direct_topic,
+                ):
+                    kept_buckets.append(bucket)
+                else:
+                    bucket_id = str((bucket or {}).get("id") or "")
+                    if bucket_id:
+                        topic_suppressed_bucket_ids.append(bucket_id)
+            selected_buckets = kept_buckets
+            if require_direct_topic:
+                selected_buckets.sort(
+                    key=lambda bucket: self._hook_focused_bucket_rank(query, bucket),
+                    reverse=True,
+                )
 
         cards: list[dict[str, Any]] = []
         recalled_ids: list[str] = []
@@ -19384,10 +19663,100 @@ class GatewayService:
                 "allow_rerank": allow_rerank,
                 "include_diffused_requested": include_diffused,
                 "diffused_skipped_reason": "hook_fast_path_uses_direct_bucket_cards",
-                "candidate_count": len(selected_buckets or []) + len(suppressed_buckets or []),
+                "admission_mode": admission_mode,
+                "light_suppressed_bucket_ids": topic_suppressed_bucket_ids if admission_mode == "light" else [],
+                "focused_full_suppressed_bucket_ids": topic_suppressed_bucket_ids if admission_mode == "full" else [],
+                "candidate_count": len(selected_buckets or []) + len(suppressed_buckets or []) + len(topic_suppressed_bucket_ids),
             },
         }
         return cards, recalled_ids, debug_payload
+
+    def _hook_bucket_has_strong_topic_evidence(
+        self,
+        query: str,
+        bucket: dict[str, Any],
+        *,
+        allow_signal: bool = True,
+    ) -> bool:
+        """Compact hook recall needs topic evidence; focused full can require direct text only."""
+        if not isinstance(bucket, dict):
+            return False
+        if self._is_source_record_bucket(bucket) and self._source_record_explicit_bucket_match_reason(query, bucket):
+            return True
+
+        signal = bucket.get("_recall_signal") if isinstance(bucket.get("_recall_signal"), dict) else {}
+        query_terms = [
+            term
+            for term in self.recall_policy.specific_query_terms(query)
+            if self._matched_query_term_is_specific(term)
+        ]
+        query_keys = list(dict.fromkeys(
+            self._compact_lookup_key(term)
+            for term in query_terms
+            if self._compact_lookup_key(term)
+        ))
+        matched_keys = list(dict.fromkeys(
+            self._compact_lookup_key(term)
+            for term in self._debug_str_list(signal.get("matched_query_terms"))
+            if allow_signal and self._matched_query_term_is_specific(term) and self._compact_lookup_key(term)
+        ))
+
+        bucket_key = self._compact_lookup_key(
+            " ".join(
+                [
+                    str((bucket.get("metadata") or {}).get("name") or bucket.get("name") or ""),
+                    bucket_content_for_recall(bucket),
+                ]
+            )
+        )
+        direct_matches = [key for key in query_keys if key and key in bucket_key]
+        evidence_keys = list(dict.fromkeys([*matched_keys, *direct_matches]))
+        if any(len(key) >= 4 for key in evidence_keys):
+            return True
+        if len(evidence_keys) >= 2:
+            return True
+        if len(query_keys) <= 1 and any(len(key) >= 3 for key in evidence_keys):
+            return True
+
+        residue = self._hook_light_query_residue(query)
+        return bool(len(residue) >= 4 and residue in bucket_key)
+
+    def _hook_focused_bucket_rank(self, query: str, bucket: dict[str, Any]) -> tuple[int, int, int, int]:
+        """Prefer direct, concentrated evidence over broad multi-topic source documents."""
+        metadata = bucket.get("metadata") if isinstance(bucket.get("metadata"), dict) else {}
+        title_key = self._compact_lookup_key(
+            str(metadata.get("name") or bucket.get("name") or "")
+        )
+        content = bucket_content_for_recall(bucket)
+        content_key = self._compact_lookup_key(content)
+        query_keys = list(dict.fromkeys(
+            self._compact_lookup_key(term)
+            for term in self.recall_policy.specific_query_terms(query)
+            if self._matched_query_term_is_specific(term) and self._compact_lookup_key(term)
+        ))
+        direct_matches = [key for key in query_keys if key and key in f"{title_key}{content_key}"]
+        longest = max((len(key) for key in direct_matches), default=0)
+        title_hits = sum(1 for key in direct_matches if key and key in title_key)
+        purpose_cues = 0
+        if re.search(r"(?:干嘛|用途|作用|用来|用于|做什么|是什么)", str(query or "")):
+            purpose_cues = sum(
+                1
+                for cue in ("用来", "用于", "专门", "记录", "写", "用途", "作用")
+                if cue in str(content or "")
+            )
+        return (longest, len(set(direct_matches)), purpose_cues + title_hits, -len(content_key))
+
+    def _hook_light_query_residue(self, query: str) -> str:
+        text = strip_human_date_references(str(query or ""))
+        shell_terms = set(date_recall_shell_terms(self.identity)) | {
+            "凌晨", "清晨", "早晨", "早上", "上午", "中午", "下午", "傍晚", "晚上",
+            "大成功", "成功", "希望", "等等", "再等等", "回来", "回来啦", "复刻",
+            "老公", "老婆", "哥哥", "妹妹", "宝贝", "宝宝",
+        }
+        for term in sorted(shell_terms, key=lambda item: len(str(item)), reverse=True):
+            if str(term).strip():
+                text = text.replace(str(term), " ")
+        return self._compact_lookup_key(text)
 
     def _hook_recall_card_from_bucket(
         self,
@@ -19419,15 +19788,20 @@ class GatewayService:
             )
         )
         view = normalize_memory_metadata(bucket)
+        kind = str(view.get("kind") or "")
+        usage_mode, mention_policy = self._memory_usage_policy(query, kind=kind, source="direct")
         note = {
             "use": "standard",
             "why": "Gateway selected this memory for the current message.",
             "reliability": "direct_match" if reliable else "weak_context",
-            "mention_policy": "standard",
+            "usage_mode": usage_mode,
+            "mention_policy": mention_policy,
             "conflict_rule": "current_user_message_wins",
             "canonical_domain": str(view.get("canonical_domain") or ""),
-            "kind": str(view.get("kind") or ""),
+            "kind": kind,
             "status_view": str(view.get("status_view") or ""),
+            "stability_class": str(signal.get("stability_class") or view.get("stability_class") or "phase"),
+            "validity_state": str(signal.get("validity_state") or view.get("validity_state") or "current"),
             "flags": list(view.get("flags") or []),
         }
         row = {
@@ -19463,12 +19837,17 @@ class GatewayService:
         seen: set[tuple[str, str]] = set()
 
         def add_card(card: dict[str, Any] | None) -> None:
-            if not card or len(cards) >= max_cards:
-                return
-            if not str(card.get("text") or "").strip():
+            if not card or not str(card.get("text") or "").strip():
                 return
             key = (str(card.get("bucket_id") or ""), str(card.get("moment_id") or ""))
             if key in seen:
+                return
+            for index, existing in enumerate(cards):
+                if self._hook_recall_cards_semantically_same(existing, card):
+                    cards[index] = self._merge_hook_recall_cards(existing, card, max_chars=max_chars)
+                    seen.add(key)
+                    return
+            if len(cards) >= max_cards:
                 return
             seen.add(key)
             cards.append(card)
@@ -19504,6 +19883,94 @@ class GatewayService:
                 if len(cards) >= max_cards:
                     break
         return cards
+
+    @classmethod
+    def _hook_recall_cards_semantically_same(cls, left: dict[str, Any], right: dict[str, Any]) -> bool:
+        left_text = cls._hook_recall_similarity_text(left)
+        right_text = cls._hook_recall_similarity_text(right)
+        if not left_text or not right_text:
+            return False
+        if min(len(left_text), len(right_text)) >= 12 and (left_text in right_text or right_text in left_text):
+            return True
+        similarity = cls._hook_recall_bigram_jaccard(left_text, right_text)
+        if similarity >= 0.68:
+            return True
+        left_title = cls._hook_recall_compact_text(left.get("title"))
+        right_title = cls._hook_recall_compact_text(right.get("title"))
+        return bool(left_title and left_title == right_title and similarity >= 0.45)
+
+    @classmethod
+    def _merge_hook_recall_cards(
+        cls,
+        left: dict[str, Any],
+        right: dict[str, Any],
+        *,
+        max_chars: int,
+    ) -> dict[str, Any]:
+        left_score = float(left.get("score") or 0.0)
+        right_score = float(right.get("score") or 0.0)
+        left_text = str(left.get("text") or "").strip()
+        right_text = str(right.get("text") or "").strip()
+        if right_score > left_score + 0.05 or (abs(right_score - left_score) <= 0.05 and len(right_text) > len(left_text)):
+            primary, secondary = dict(right), dict(left)
+        else:
+            primary, secondary = dict(left), dict(right)
+        provenance_ids = list(dict.fromkeys(
+            [
+                *[str(value) for value in primary.get("provenance_ids") or [] if str(value).strip()],
+                str(primary.get("id") or ""),
+                *[str(value) for value in secondary.get("provenance_ids") or [] if str(value).strip()],
+                str(secondary.get("id") or ""),
+            ]
+        ))
+        provenance_ids = [value for value in provenance_ids if value]
+        source_kinds = list(dict.fromkeys(
+            [
+                *[str(value) for value in primary.get("source_kinds") or [] if str(value).strip()],
+                str(primary.get("source_kind") or ""),
+                *[str(value) for value in secondary.get("source_kinds") or [] if str(value).strip()],
+                str(secondary.get("source_kind") or ""),
+            ]
+        ))
+        source_kinds = [value for value in source_kinds if value]
+        deltas = [str(value).strip() for value in primary.get("deltas") or [] if str(value).strip()]
+        secondary_text = str(secondary.get("text") or "").strip()
+        primary_text = str(primary.get("text") or "").strip()
+        compact_primary = cls._hook_recall_compact_text(primary_text)
+        compact_secondary = cls._hook_recall_compact_text(secondary_text)
+        if (
+            secondary_text
+            and compact_secondary != compact_primary
+            and compact_secondary not in compact_primary
+            and compact_primary not in compact_secondary
+        ):
+            deltas.append(secondary_text[: max(80, min(240, max_chars // 3))])
+        primary["provenance_ids"] = provenance_ids
+        primary["source_kinds"] = source_kinds
+        primary["deltas"] = list(dict.fromkeys(deltas))[:2]
+        return primary
+
+    @classmethod
+    def _hook_recall_similarity_text(cls, card: dict[str, Any]) -> str:
+        return cls._hook_recall_compact_text(
+            f"{card.get('title') or ''} {card.get('text') or ''}"
+        )
+
+    @staticmethod
+    def _hook_recall_compact_text(value: Any) -> str:
+        return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", str(value or "").lower())
+
+    @staticmethod
+    def _hook_recall_bigram_jaccard(left: str, right: str) -> float:
+        def grams(value: str) -> set[str]:
+            if len(value) <= 1:
+                return {value} if value else set()
+            return {value[index:index + 2] for index in range(len(value) - 1)}
+        left_grams = grams(left)
+        right_grams = grams(right)
+        if not left_grams or not right_grams:
+            return 0.0
+        return len(left_grams & right_grams) / max(1, len(left_grams | right_grams))
 
     def _hook_recall_confidence(self, note: dict[str, Any], row: dict[str, Any] | None) -> str:
         reliability = str(note.get("reliability") or "")
@@ -19704,13 +20171,22 @@ class GatewayService:
                 "use": "standard",
                 "why": "Gateway selected this memory for the current message.",
                 "reliability": "weak_context",
-                "mention_policy": "standard",
+                "usage_mode": "silent",
+                "mention_policy": "never_mention_unless_user_asks",
                 "conflict_rule": "current_user_message_wins",
                 "canonical_domain": "",
                 "kind": "",
                 "status_view": "",
+                "stability_class": "phase",
+                "validity_state": "current",
                 "flags": [],
             }
+        else:
+            note = dict(note)
+        if row.get("stability_class"):
+            note["stability_class"] = str(row.get("stability_class"))
+        if row.get("validity_state"):
+            note["validity_state"] = str(row.get("validity_state"))
         card_text = self._clip_text(" ".join(str(text or "").split()), max_chars)
         source_ref = f"ombre:{bucket_id}"
         if moment_id:
@@ -19728,16 +20204,25 @@ class GatewayService:
         if numeric_score <= 0:
             confidence_label = self._hook_recall_confidence(note, row)
             numeric_score = {"high": 0.78, "medium": 0.62, "low": 0.42}.get(confidence_label, 0.42)
+        canonical_seed = self._hook_recall_compact_text(f"{title} {card_text}") or source_ref
+        canonical_group_id = "canonical:" + hashlib.sha1(canonical_seed.encode("utf-8")).hexdigest()[:16]
         return {
             "id": source_ref,
             "source": "ombre",
             "source_kind": source,
+            "source_kinds": [source],
+            "provenance_ids": [source_ref],
+            "canonical_group_id": canonical_group_id,
             "bucket_id": bucket_id,
             "moment_id": moment_id,
             "title": title,
             "text": card_text,
             "score": round(max(0.0, min(1.0, numeric_score)), 4),
             "render_shape": render_shape,
+            "reading_note": dict(note),
+            "usage_mode": str(note.get("usage_mode") or "silent"),
+            "mention_policy": str(note.get("mention_policy") or "never_mention_unless_user_asks"),
+            "deltas": [],
         }
 
     @staticmethod
@@ -19760,11 +20245,24 @@ class GatewayService:
             title = str(card.get("title") or "").strip()
             if title:
                 parts.append(f"title: {title}")
+            parts.append(f"usage_mode: {card.get('usage_mode') or 'silent'}")
+            parts.append(f"mention_policy: {card.get('mention_policy') or 'never_mention_unless_user_asks'}")
+            note = card.get("reading_note") if isinstance(card.get("reading_note"), dict) else {}
+            parts.append(f"stability_class: {note.get('stability_class') or 'phase'}")
+            parts.append(f"validity_state: {note.get('validity_state') or 'current'}")
+            provenance = [str(value) for value in card.get("provenance_ids") or [] if str(value).strip()]
+            if provenance:
+                parts.append("provenance: " + ", ".join(provenance[:6]))
             if str(card.get("source_kind") or "") == "diffused":
                 parts.append("association_not_current_fact: true")
             if text:
                 parts.append("text: |")
                 parts.extend(f"  {line}" for line in text.splitlines())
+            for delta in card.get("deltas") or []:
+                delta_text = str(delta or "").strip()
+                if delta_text:
+                    parts.append("delta: |")
+                    parts.extend(f"  {line}" for line in delta_text.splitlines())
             parts.append("[/memory_card]")
         return "\n".join(parts).strip()
 
@@ -19787,26 +20285,138 @@ class GatewayService:
         debug_payload: dict[str, Any],
         *,
         include_diffused: bool,
+        cards: list[dict[str, Any]] | None = None,
     ) -> str:
-        """Return recall evidence only; Bridge owns reminders and care state."""
-        _stable_context, dynamic_context = self._build_injected_context_messages(
-            "",
-            "",
-            "",
-            just_now_context=str(debug_payload.get("just_now_context") or ""),
-            recent_context=str(debug_payload.get("recent_context") or ""),
-            recalled_memory=str(debug_payload.get("recalled_memory") or ""),
-            related_memory=(
-                str(debug_payload.get("diffused_memory") or "")
-                if include_diffused
-                else ""
-            ),
-            targeted_memory_detail=str(debug_payload.get("targeted_memory_detail") or ""),
-            dream_context=str(debug_payload.get("dream_context") or ""),
-            date_persona_trace=str(debug_payload.get("date_persona_trace") or ""),
-            date_recall=str(debug_payload.get("date_recall") or ""),
+        """Return compact canonical recall evidence only; Bridge owns reminders and care state."""
+        payload = debug_payload if isinstance(debug_payload, dict) else {}
+        cards = list(cards or [])
+        sections: list[str] = [
+            "Memory Reading Policy\n" + self._memory_reading_policy_context(),
+        ]
+
+        def add_section(title: str, content: str) -> None:
+            cleaned = str(content or "").strip()
+            if cleaned:
+                sections.append(f"{title}\n{cleaned}")
+
+        add_section(
+            "Just Now Chat Context",
+            self._dedupe_context_lines(str(payload.get("just_now_context") or "")),
         )
-        return dynamic_context
+        add_section(
+            "Date Recall",
+            self._dedupe_context_lines(str(payload.get("date_recall") or "")),
+        )
+        if cards:
+            add_section("Canonical Recall", self._render_hook_recall_canonical_cards(cards))
+        else:
+            add_section("Recalled Memory", str(payload.get("recalled_memory") or ""))
+            if include_diffused:
+                add_section("Diffused Memory", str(payload.get("diffused_memory") or ""))
+
+        add_section(
+            "Targeted Memory Detail",
+            self._filter_redundant_context_against_cards(
+                str(payload.get("targeted_memory_detail") or ""),
+                cards,
+            ),
+        )
+        add_section(
+            "Recent Context",
+            self._filter_redundant_context_against_cards(
+                str(payload.get("recent_context") or ""),
+                cards,
+            ),
+        )
+        add_section("Date Persona Trace", str(payload.get("date_persona_trace") or ""))
+        add_section("Dream Context", str(payload.get("dream_context") or ""))
+        return "\n\n".join(section for section in sections if section.strip()).strip()
+
+    @staticmethod
+    def _render_hook_recall_canonical_cards(cards: list[dict[str, Any]]) -> str:
+        lines = [
+            "Similar historical/source/bucket evidence has been collapsed into canonical groups. "
+            "Use the core once; deltas are the only additional changes worth carrying forward."
+        ]
+        for card in cards:
+            group_id = str(card.get("canonical_group_id") or card.get("id") or "")
+            lines.append(f"[canonical_memory group={group_id}]")
+            title = str(card.get("title") or "").strip()
+            if title:
+                lines.append(f"title: {title}")
+            lines.append(f"usage_mode: {card.get('usage_mode') or 'silent'}")
+            lines.append(f"mention_policy: {card.get('mention_policy') or 'never_mention_unless_user_asks'}")
+            note = card.get("reading_note") if isinstance(card.get("reading_note"), dict) else {}
+            lines.append(f"stability_class: {note.get('stability_class') or 'phase'}")
+            lines.append(f"validity_state: {note.get('validity_state') or 'current'}")
+            core = str(card.get("text") or "").strip()
+            if core:
+                lines.append("core: |")
+                lines.extend(f"  {line}" for line in core.splitlines())
+            for delta in card.get("deltas") or []:
+                delta_text = str(delta or "").strip()
+                if delta_text:
+                    lines.append("delta: |")
+                    lines.extend(f"  {line}" for line in delta_text.splitlines())
+            provenance = [str(value) for value in card.get("provenance_ids") or [] if str(value).strip()]
+            if provenance:
+                lines.append("provenance: " + ", ".join(provenance[:6]))
+            lines.append("[/canonical_memory]")
+        return "\n".join(lines).strip()
+
+    @classmethod
+    def _filter_redundant_context_against_cards(
+        cls,
+        block: str,
+        cards: list[dict[str, Any]],
+    ) -> str:
+        text = str(block or "").strip()
+        if not text or not cards:
+            return text
+        kept: list[str] = []
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            candidate = re.sub(r"^[-*]\s*", "", line).strip()
+            if candidate.startswith("reading_note:"):
+                continue
+            if any(
+                cls._hook_recall_texts_semantically_same(
+                    candidate,
+                    f"{card.get('title') or ''} {card.get('text') or ''}",
+                )
+                for card in cards
+            ):
+                continue
+            kept.append(raw_line.rstrip())
+        return "\n".join(kept).strip()
+
+    @classmethod
+    def _hook_recall_texts_semantically_same(cls, left: str, right: str) -> bool:
+        left_text = cls._hook_recall_compact_text(left)
+        right_text = cls._hook_recall_compact_text(right)
+        if not left_text or not right_text:
+            return False
+        if min(len(left_text), len(right_text)) >= 10 and (left_text in right_text or right_text in left_text):
+            return True
+        return cls._hook_recall_bigram_jaccard(left_text, right_text) >= 0.68
+
+    @staticmethod
+    def _dedupe_context_lines(block: str) -> str:
+        seen: set[str] = set()
+        kept: list[str] = []
+        for raw_line in str(block or "").splitlines():
+            normalized = re.sub(r"\s+", " ", raw_line).strip().lower()
+            if not normalized:
+                if kept and kept[-1] != "":
+                    kept.append("")
+                continue
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            kept.append(raw_line.rstrip())
+        return "\n".join(kept).strip()
 
     def _inject_context_messages(
         self,
@@ -21046,6 +21656,46 @@ class GatewayService:
             cut = max(1, int(len(trimmed) * 0.85))
             trimmed = trimmed[:cut].rstrip()
         return trimmed
+
+    def _memory_stability_payload(self, bucket: dict[str, Any], query_plan: Any = None) -> dict[str, Any]:
+        view = normalize_memory_metadata(bucket)
+        meta = bucket.get("metadata", {}) if isinstance(bucket.get("metadata"), dict) else {}
+        stability_class = str(view.get("stability_class") or "phase")
+        validity_state = str(view.get("validity_state") or "current")
+        reference = self._parse_iso(meta.get("date") or meta.get("updated_at") or meta.get("created"))
+        age_days = max(0.0, (datetime.now() - reference).total_seconds() / 86400) if reference else 0.0
+
+        if stability_class == "stable":
+            multiplier = 1.0
+        elif stability_class == "preference":
+            multiplier = 1.0 if age_days <= 90 else 0.90 if age_days <= 365 else 0.80
+        elif stability_class == "ephemeral":
+            multiplier = 1.0 if age_days <= 1 else 0.55 if age_days <= 3 else 0.30 if age_days <= 7 else 0.12
+        else:
+            multiplier = 1.0 if age_days <= 7 else 0.75 if age_days <= 30 else 0.50 if age_days <= 90 else 0.30
+
+        if validity_state == "current" and stability_class == "ephemeral" and age_days > 3:
+            validity_state = "stale"
+        elif validity_state == "current" and stability_class == "phase" and age_days > 90:
+            validity_state = "historical"
+
+        if validity_state == "expired":
+            multiplier = min(multiplier, 0.12)
+        elif validity_state == "superseded":
+            multiplier = min(multiplier, 0.15)
+        elif validity_state == "stale":
+            multiplier = min(multiplier, 0.30)
+        elif validity_state == "historical":
+            multiplier = min(multiplier, 0.45)
+
+        if bool(getattr(query_plan, "explicit_old_memory", False)):
+            multiplier = max(multiplier, 0.85)
+        return {
+            "stability_class": stability_class,
+            "validity_state": validity_state,
+            "age_days": round(age_days, 3),
+            "multiplier": round(self._clamp(multiplier), 4),
+        }
 
     def _parse_iso(self, value: Any) -> datetime | None:
         if not value:

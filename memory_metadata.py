@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+from datetime import datetime, timezone
 from typing import Any
 
 DOMAIN_LABELS = {
@@ -40,7 +41,9 @@ MEMORY_KINDS = {
     "relationship_weather",
 }
 
-STATUS_VIEWS = {"active", "unresolved", "digested", "archived", "protected"}
+STATUS_VIEWS = {"active", "unresolved", "digested", "archived", "protected", "superseded"}
+STABILITY_CLASSES = {"stable", "preference", "phase", "ephemeral"}
+VALIDITY_STATES = {"current", "historical", "stale", "superseded", "expired"}
 
 LEGACY_DOMAIN_MAP = {
     "relationship.identity": "relationship",
@@ -408,6 +411,13 @@ def normalize_memory_metadata(bucket: dict[str, Any] | None) -> dict[str, Any]:
         or _infer_domain(legacy_domain, tags, type_value, path_value, kind)
         or "general"
     )
+    stability_class = _normalize_stability(meta.get("stability_class")) or _infer_stability_class(
+        kind,
+        status_view,
+        flags,
+        tags,
+    )
+    validity_state = _infer_validity_state(meta, status_view)
 
     parent = domain_parent(canonical_domain)
     return {
@@ -417,6 +427,8 @@ def normalize_memory_metadata(bucket: dict[str, Any] | None) -> dict[str, Any]:
         "domain_parent_label": DOMAIN_PARENT_LABELS.get(parent, parent),
         "kind": kind,
         "status_view": status_view,
+        "stability_class": stability_class,
+        "validity_state": validity_state,
         "flags": flags,
         "legacy_domain": legacy_domain,
     }
@@ -494,6 +506,49 @@ def _normalize_status(value: Any) -> str:
     return compact if compact in STATUS_VIEWS else ""
 
 
+def _normalize_stability(value: Any) -> str:
+    compact = _compact(value)
+    return compact if compact in STABILITY_CLASSES else ""
+
+
+def _infer_stability_class(kind: str, status_view: str, flags: list[str], tags: list[str]) -> str:
+    tag_keys = {_compact(tag) for tag in tags}
+    if {"ephemeral", "temporary", "current_state", "临时", "一次性", "当下状态"} & tag_keys:
+        return "ephemeral"
+    if {"phase", "stage", "阶段", "阶段计划", "近期计划"} & tag_keys:
+        return "phase"
+    if kind == "preference":
+        return "preference"
+    if kind == "profile_fact" or status_view == "protected" or {"pinned", "protected"} & set(flags):
+        return "stable"
+    if kind in {"affect_anchor", "daily_impression"}:
+        return "ephemeral"
+    if kind in {"relationship_weather", "reflection", "event", "source_record", "raw_import"}:
+        return "phase"
+    return "phase"
+
+
+def _infer_validity_state(meta: dict[str, Any], status_view: str) -> str:
+    explicit = _compact(meta.get("validity_state"))
+    if explicit in VALIDITY_STATES:
+        return explicit
+    if status_view == "superseded" or _clean(meta.get("superseded_by")):
+        return "superseded"
+    valid_until = _clean(meta.get("valid_until"))
+    if valid_until:
+        try:
+            parsed = datetime.fromisoformat(valid_until.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            if parsed.astimezone(timezone.utc) < datetime.now(timezone.utc):
+                return "expired"
+        except ValueError:
+            pass
+    if status_view in {"archived", "digested"}:
+        return "historical"
+    return "current"
+
+
 def _infer_domain(
     legacy_domain: list[str],
     tags: list[str],
@@ -546,6 +601,8 @@ def _infer_status(
     blob = " ".join([type_value, path_value, " ".join(legacy_domain), " ".join(tags)])
     compact = _compact(blob)
     path_parts = {part.lower() for part in re.split(r"[\\/]+", path_value) if part}
+    if _clean(meta.get("superseded_by")) or "superseded" in compact or "已替代" in blob:
+        return "superseded"
     if type_value == "archived" or "archive" in path_parts or "archived" in path_parts or "归档" in blob:
         return "archived"
     if _truthy(meta.get("protected")) or _truthy(meta.get("pinned")):

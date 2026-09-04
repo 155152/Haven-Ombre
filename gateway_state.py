@@ -149,6 +149,38 @@ class GatewayStateStore:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS recall_feedback (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                turn_id TEXT NOT NULL,
+                bucket_id TEXT NOT NULL,
+                label TEXT NOT NULL,
+                confidence REAL NOT NULL DEFAULT 0.5,
+                created_at TEXT NOT NULL,
+                detail_json TEXT NOT NULL DEFAULT '{}',
+                UNIQUE(session_id, turn_id, bucket_id, label)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_recall_feedback_bucket
+            ON recall_feedback (bucket_id, created_at DESC, id DESC)
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS memory_validity_overrides (
+                bucket_id TEXT PRIMARY KEY,
+                validity_state TEXT NOT NULL,
+                reason TEXT NOT NULL DEFAULT '',
+                source_turn_id TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
         conn.commit()
         conn.close()
 
@@ -190,6 +222,7 @@ class GatewayStateStore:
         bucket_ids: list[str],
         *,
         recent_context_injected: bool = False,
+        feedback: list[dict[str, Any]] | None = None,
         completed_at: datetime | None = None,
     ) -> dict[str, Any]:
         session_id = str(session_id or "").strip()
@@ -238,6 +271,13 @@ class GatewayStateStore:
                     """,
                     (session_id, next_round, completed_iso),
                 )
+            feedback_count = self._record_recall_feedback_rows(
+                conn,
+                session_id=session_id,
+                turn_id=turn_id,
+                rows=feedback or [],
+                created_at=completed_iso,
+            )
             conn.execute(
                 """
                 INSERT INTO hook_completions (session_id, turn_id, round_id, completed_at)
@@ -246,12 +286,139 @@ class GatewayStateStore:
                 (session_id, turn_id, next_round, completed_iso),
             )
             conn.commit()
-            return {"recorded": True, "round_id": next_round}
+            result = {"recorded": True, "round_id": next_round}
+            if feedback_count > 0:
+                result["feedback_count"] = feedback_count
+            return result
         except Exception:
             conn.rollback()
             raise
         finally:
             conn.close()
+
+    @staticmethod
+    def _record_recall_feedback_rows(
+        conn: sqlite3.Connection,
+        *,
+        session_id: str,
+        turn_id: str,
+        rows: list[dict[str, Any]],
+        created_at: str,
+    ) -> int:
+        allowed_labels = {"useful", "redundant", "off_topic", "stale"}
+        inserted = 0
+        for raw in list(rows or [])[:40]:
+            if not isinstance(raw, dict):
+                continue
+            bucket_id = str(raw.get("bucket_id") or "").strip()
+            label = str(raw.get("label") or "").strip().lower()
+            if not bucket_id or label not in allowed_labels:
+                continue
+            try:
+                confidence = max(0.0, min(1.0, float(raw.get("confidence", 0.5))))
+            except (TypeError, ValueError):
+                confidence = 0.5
+            detail = raw.get("detail") if isinstance(raw.get("detail"), dict) else {}
+            cursor = conn.execute(
+                """
+                INSERT OR IGNORE INTO recall_feedback
+                (session_id, turn_id, bucket_id, label, confidence, created_at, detail_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session_id,
+                    turn_id,
+                    bucket_id,
+                    label,
+                    confidence,
+                    created_at,
+                    json.dumps(detail, ensure_ascii=False),
+                ),
+            )
+            inserted += max(0, int(cursor.rowcount or 0))
+            if label == "stale" and confidence >= 0.55:
+                validity_state = "superseded" if bool(detail.get("conflict")) else "stale"
+                reason = str(detail.get("reason") or ("current_message_conflict" if detail.get("conflict") else "recall_feedback_stale"))
+                conn.execute(
+                    """
+                    INSERT INTO memory_validity_overrides
+                    (bucket_id, validity_state, reason, source_turn_id, updated_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(bucket_id) DO UPDATE SET
+                        validity_state = excluded.validity_state,
+                        reason = excluded.reason,
+                        source_turn_id = excluded.source_turn_id,
+                        updated_at = excluded.updated_at
+                    """,
+                    (bucket_id, validity_state, reason, turn_id, created_at),
+                )
+        return inserted
+
+    def get_recall_feedback_profiles(self, bucket_ids: list[str] | set[str] | tuple[str, ...]) -> dict[str, dict[str, Any]]:
+        ids = list(dict.fromkeys(str(value or "").strip() for value in bucket_ids if str(value or "").strip()))
+        if not ids:
+            return {}
+        placeholders = ",".join("?" for _ in ids)
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                f"""
+                SELECT bucket_id,
+                    SUM(CASE WHEN label = 'useful' THEN confidence ELSE 0 END) AS useful,
+                    SUM(CASE WHEN label = 'redundant' THEN confidence ELSE 0 END) AS redundant,
+                    SUM(CASE WHEN label = 'off_topic' THEN confidence ELSE 0 END) AS off_topic,
+                    SUM(CASE WHEN label = 'stale' THEN confidence ELSE 0 END) AS stale
+                FROM recall_feedback
+                WHERE bucket_id IN ({placeholders})
+                GROUP BY bucket_id
+                """,
+                ids,
+            ).fetchall()
+            override_rows = conn.execute(
+                f"""
+                SELECT bucket_id, validity_state, reason, source_turn_id, updated_at
+                FROM memory_validity_overrides
+                WHERE bucket_id IN ({placeholders})
+                """,
+                ids,
+            ).fetchall()
+        finally:
+            conn.close()
+        profiles: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            useful = float(row["useful"] or 0.0)
+            redundant = float(row["redundant"] or 0.0)
+            off_topic = float(row["off_topic"] or 0.0)
+            stale = float(row["stale"] or 0.0)
+            multiplier = 1.0
+            multiplier += min(0.12, useful * 0.03)
+            multiplier -= min(0.18, redundant * 0.06)
+            multiplier -= min(0.30, off_topic * 0.10)
+            multiplier -= min(0.45, stale * 0.20)
+            profiles[str(row["bucket_id"])] = {
+                "useful": useful,
+                "redundant": redundant,
+                "off_topic": off_topic,
+                "stale": stale,
+                "multiplier": max(0.35, min(1.12, multiplier)),
+                "validity_state": "current",
+            }
+        for row in override_rows:
+            bucket_id = str(row["bucket_id"])
+            profile = profiles.setdefault(
+                bucket_id,
+                {"useful": 0.0, "redundant": 0.0, "off_topic": 0.0, "stale": 0.0, "multiplier": 1.0},
+            )
+            validity_state = str(row["validity_state"] or "current")
+            profile["validity_state"] = validity_state
+            profile["validity_reason"] = str(row["reason"] or "")
+            profile["validity_source_turn_id"] = str(row["source_turn_id"] or "")
+            profile["validity_updated_at"] = str(row["updated_at"] or "")
+            if validity_state == "superseded":
+                profile["multiplier"] = min(float(profile.get("multiplier") or 1.0), 0.18)
+            elif validity_state == "stale":
+                profile["multiplier"] = min(float(profile.get("multiplier") or 1.0), 0.35)
+        return profiles
 
     def get_current_round(self, session_id: str) -> int:
         conn = self._connect()
