@@ -9001,14 +9001,14 @@ async def daily_chat_memory_review(
     date: str,
     force: bool = True,
     preserve_cursor: bool = True,
-    turn_limit: int = 60,
+    turn_limit: int = 200,
     turn_offset: int = 0,
     summarize: bool = False,
-    max_candidates: int = 3,
+    max_candidates: int = 5,
     candidate_max_tokens: int = 1600,
     min_confidence: float = 0.0,
 ) -> dict:
-    """按日期审阅 raw chat，只生成 pending candidates；硬编码 review 模式，不自动写长期 bucket。默认最多读取 60 turns、关闭窗口摘要，并恢复原 daily-chat cursor 与运行参数。"""
+    """按日期审阅 raw chat，只生成 pending candidates；硬编码 review 模式，不自动写长期 bucket。默认尽量读取完整日期窗口、关闭窗口摘要，并恢复原 daily-chat cursor 与运行参数。"""
     date_key = str(date or "").strip()
     if not date_key:
         return {"status": "error", "reason": "date_required"}

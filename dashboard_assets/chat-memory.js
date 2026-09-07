@@ -167,7 +167,8 @@
       if (!res) return;
       var data = await res.json();
       if (!res.ok) throw new Error(data.error || '补证据失败');
-      setDailyChatMemoryMessage(data.aligned ? '证据已补齐，等待你确认写入。' : '证据暂未补齐，候选已保留。', data.aligned ? 'ok' : 'error');
+      var detail = data.results && data.results[0] && data.results[0].reason ? ' · ' + data.results[0].reason : '';
+      setDailyChatMemoryMessage(data.aligned ? '证据已补齐，等待你确认写入。' : '证据暂未补齐，候选已保留' + detail + '。', data.aligned ? 'ok' : 'error');
       await loadDailyChatMemoryPending();
     } catch (e) {
       setDailyChatMemoryMessage('补证据失败，候选已保留：' + e.message, 'error');

@@ -210,6 +210,7 @@ DAILY_CHAT_MEMORY_PROVENANCE_PROMPT_TEMPLATE = """你是 Ombre 的 provenance �
 规则：
 - 不要改写候选，不要新增或删除候选，不要评价重要性。
 - source_turn_refs 只能复制 conversation_turns 里真实存在的 `turn_ref` 数字。
+- 硬限制：每条 source_turn_refs 绝对不能超过 4 个；如果直接证据多于 4 个，只保留最直接且足够支撑候选的 4 个，禁止输出第 5 个。
 - turn_ref 只是这次对齐调用里的临时编号；真正的 turn id / raw event id 会由 Ombre 代码映射，禁止你自己生成 provenance id。
 - 只选直接支撑该候选的 turns，不要因为在同一窗口就把整段都挂上。
 - 如果某条候选找不到直接证据，给空数组；review 会保留待补证据候选，auto 不会写入。
@@ -2621,6 +2622,13 @@ class ReflectionEngine:
                 continue
             candidate = self._apply_daily_chat_memory_candidate_edit(original, (edits or {}).get(candidate_id))
             if candidate.get("provenance_status") == "aligned" and candidate == original:
+                cleaned_candidate = dict(candidate)
+                cleaned_candidate.pop("provenance_error", None)
+                cleaned_candidate.pop("provenance_detail", None)
+                if cleaned_candidate != original:
+                    item["candidate"] = cleaned_candidate
+                    item["provenance_last_attempt_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                    self._save_daily_chat_memory_pending(items)
                 results.append({"id": candidate_id, "status": "aligned"})
                 continue
             candidate = {**candidate, "provenance_status": "needs_repair",
@@ -2777,13 +2785,96 @@ class ReflectionEngine:
             )
             raw = self._completion_content(response)
             parsed = self._parse_json_object(raw or "")
-            candidates = parsed.get("candidates") if isinstance(parsed, dict) else []
-            if isinstance(candidates, list):
-                return [item for item in candidates if isinstance(item, dict)]
+            candidates = self._normalize_daily_chat_memory_extracted_candidates(parsed)
+            if candidates:
+                return candidates
+
+            # One bounded structure-only retry. Do not ask the model to create
+            # new memories or broaden the conversation scope; only recover a
+            # malformed extraction container.
+            repair_response = await self._daily_chat_memory_create_completion(
+                client,
+                model=model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Repair only the JSON structure of the previous daily memory extraction. "
+                            "Do not add, remove, or rewrite memory candidates. Return only an object "
+                            "with a candidates array containing the same candidate objects."
+                        ),
+                    },
+                    {"role": "user", "content": json.dumps(parsed, ensure_ascii=False)},
+                ],
+                max_tokens=min(500, self.daily_chat_memory_candidate_max_tokens),
+                temperature=0.0,
+                use_daily_client=use_daily_client,
+            )
+            repair_parsed = self._parse_json_object(self._completion_content(repair_response) or "")
+            candidates = self._normalize_daily_chat_memory_extracted_candidates(repair_parsed)
+            if candidates:
+                return candidates
             logger.warning("Daily chat memory extraction returned invalid candidates; skipping write")
         except Exception as exc:
             logger.warning("Daily chat memory extraction failed; skipping write: %s", exc)
         return []
+
+    @staticmethod
+    def _normalize_daily_chat_memory_extracted_candidates(parsed: dict) -> list[dict]:
+        """Normalize extraction response shape without inventing candidates.
+
+        The model may drift between common container names, but the application
+        owns the final candidate list. Unknown shapes remain rejected.
+        """
+        if not isinstance(parsed, dict):
+            return []
+        candidates = parsed.get("candidates")
+        if isinstance(candidates, list):
+            return [item for item in candidates if isinstance(item, dict)]
+        items = parsed.get("items")
+        if isinstance(items, list):
+            return [item for item in items if isinstance(item, dict)]
+        return []
+
+    @staticmethod
+    def _normalize_daily_chat_memory_provenance_alignments(parsed: dict) -> list[dict] | None:
+        """Normalize model output shape without changing evidence choices.
+
+        The model may choose evidence refs, but the application owns the
+        transport shape. Harmless wrapper / field-name drift is normalized;
+        missing or unrelated payloads remain invalid.
+        """
+        if not isinstance(parsed, dict):
+            return None
+
+        def normalize_item(item: Any) -> dict | None:
+            if not isinstance(item, dict) or "candidate_index" not in item:
+                return None
+            if "source_turn_refs" in item:
+                return item
+            if "source_turn_ids" in item:
+                return {**item, "source_turn_refs": item.get("source_turn_ids")}
+            if "turn_refs" in item:
+                return {**item, "source_turn_refs": item.get("turn_refs")}
+            return None
+
+        alignments = parsed.get("alignments")
+        if isinstance(alignments, list):
+            normalized = []
+            for item in alignments:
+                normalized_item = normalize_item(item)
+                if normalized_item is None:
+                    return None
+                normalized.append(normalized_item)
+            return normalized
+
+        if isinstance(alignments, dict):
+            normalized_item = normalize_item(alignments)
+            return [normalized_item] if normalized_item is not None else None
+
+        # Some providers omit the alignments wrapper for a single result.
+        normalized_item = normalize_item(parsed)
+        return [normalized_item] if normalized_item is not None else None
 
     async def _align_daily_chat_memory_candidate_sources(
         self,
@@ -2845,16 +2936,53 @@ class ReflectionEngine:
                 use_daily_client=use_daily_client,
             )
             parsed = self._parse_json_object(self._completion_content(response) or "")
-            alignments = parsed.get("alignments") if isinstance(parsed, dict) else []
+            alignments = self._normalize_daily_chat_memory_provenance_alignments(parsed)
+            if alignments is None:
+                # One bounded format-only retry. The model may repair JSON shape,
+                # but it must not reconsider evidence or expand the source scope.
+                repair_response = await self._daily_chat_memory_create_completion(
+                    client,
+                    model=model,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": (
+                                "Repair only the JSON structure of the previous provenance response. "
+                                "Do not change evidence choices. Return only an object with "
+                                "alignments as an array of objects containing candidate_index "
+                                "and source_turn_refs."
+                            ),
+                        },
+                        {"role": "user", "content": json.dumps(parsed, ensure_ascii=False)},
+                    ],
+                    max_tokens=min(300, self.daily_chat_memory_candidate_max_tokens),
+                    temperature=0.0,
+                    use_daily_client=use_daily_client,
+                )
+                repair_parsed = self._parse_json_object(self._completion_content(repair_response) or "")
+                alignments = self._normalize_daily_chat_memory_provenance_alignments(repair_parsed)
         except Exception as exc:
             logger.warning("Daily chat memory provenance alignment failed: %s", exc)
             for candidate in candidates:
                 candidate["provenance_error"] = "alignment_failed"
             return candidates
-        if not isinstance(alignments, list):
-            logger.warning("Daily chat memory provenance alignment invalid payload")
+        if alignments is None:
+            raw_response = self._completion_content(response) or ""
+            parsed_keys = sorted(parsed.keys()) if isinstance(parsed, dict) else []
+            if not parsed:
+                reason = "json_parse_failed" if raw_response else "empty_response"
+            elif "alignments" not in parsed:
+                reason = "missing_alignments"
+            else:
+                reason = "invalid_alignment_shape"
+            logger.warning(
+                "Daily chat memory provenance invalid payload reason=%s keys=%s",
+                reason,
+                parsed_keys,
+            )
             for candidate in candidates:
                 candidate["provenance_error"] = "invalid_payload"
+                candidate["provenance_detail"] = reason
             return candidates
 
         allowed_turn_refs = set(turns_by_ref)
@@ -2903,6 +3031,7 @@ class ReflectionEngine:
                 aligned[index]["source_event_ids"] = source_event_ids
             aligned[index]["provenance_status"] = "aligned"
             aligned[index].pop("provenance_error", None)
+            aligned[index].pop("provenance_detail", None)
             aligned_count += 1
         logger.info(
             "Daily chat memory provenance alignment: candidates=%d aligned=%d",
@@ -4668,7 +4797,12 @@ class ReflectionEngine:
         return {
             "max_tokens": max_tokens,
             "temperature": temperature,
-            "extra_body": {"enable_thinking": False},
+            "response_format": {"type": "json_object"},
+            # SenseNova follows the same thinking contract already used by the
+            # rest of Ombre. `enable_thinking=false` is ignored by this provider
+            # and may spend the whole completion budget on reasoning, leaving
+            # message.content empty. Force disabled thinking explicitly.
+            "extra_body": {"thinking": {"type": "disabled"}},
         }
 
     @staticmethod
@@ -4697,8 +4831,9 @@ class ReflectionEngine:
             completion_options = self._completion_options(
                 max_tokens=max_tokens,
                 temperature=temperature,
-                thinking_mode="",
+                thinking_mode="disabled",
             )
+            completion_options["response_format"] = {"type": "json_object"}
         return await client.chat.completions.create(
             model=model,
             messages=messages,
@@ -4712,9 +4847,15 @@ class ReflectionEngine:
                 cleaned = cleaned.split("\n", 1)[-1].rsplit("```", 1)[0]
             parsed = json.loads(cleaned)
         except (json.JSONDecodeError, IndexError, ValueError):
-            logger.warning("Reflection JSON parse failed: %s", raw[:200])
+            logger.warning(
+                "Reflection JSON parse failed: %s",
+                raw[:200] if raw else "<empty_response>",
+            )
             return {}
-        return parsed if isinstance(parsed, dict) else {}
+        if not isinstance(parsed, dict):
+            logger.warning("Reflection JSON object expected, got %s", type(parsed).__name__)
+            return {}
+        return parsed
 
     @staticmethod
     def _string_list(value: Any, limit: int) -> list[str]:

@@ -119,6 +119,48 @@ def test_review_success_maps_only_selected_events(engine, monkeypatch):
     assert engine.list_daily_chat_memory_pending()[0]["candidate"]["provenance_status"] == "aligned"
 
 
+def test_daily_chat_memory_completion_disables_thinking_with_provider_contract(engine):
+    options = engine._daily_chat_memory_completion_options(max_tokens=1600, temperature=0.0)
+    assert options["response_format"] == {"type": "json_object"}
+    assert options["extra_body"] == {"thinking": {"type": "disabled"}}
+    assert "enable_thinking" not in options["extra_body"]
+
+
+def test_daily_chat_memory_fallback_client_also_disables_thinking(engine):
+    calls = {}
+
+    class Completions:
+        async def create(self, **kwargs):
+            calls.update(kwargs)
+            return SimpleNamespace(choices=[])
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+    asyncio.run(engine._daily_chat_memory_create_completion(
+        client,
+        model="fake",
+        messages=[{"role": "user", "content": "{}"}],
+        max_tokens=1600,
+        temperature=0.0,
+        use_daily_client=False,
+    ))
+    assert calls["response_format"] == {"type": "json_object"}
+    assert calls["extra_body"] == {"thinking": {"type": "disabled"}}
+
+
+@pytest.mark.parametrize("payload", [
+    {"alignments": [{"candidate_index": 0, "source_turn_ids": [17, 18]}]},
+    {"alignments": [{"candidate_index": 0, "turn_refs": [17, 18]}]},
+    {"alignments": {"candidate_index": 0, "source_turn_ids": [17, 18]}},
+    {"candidate_index": 0, "source_turn_ids": [17, 18]},
+    {"candidate_index": 0, "turn_refs": [17, 18]},
+])
+def test_review_normalizes_provenance_transport_shape(engine, monkeypatch, payload):
+    model(monkeypatch, engine, payload)
+    candidate = run(engine, Events())["candidates"][0]
+    assert candidate["provenance_status"] == "aligned"
+    assert candidate["source_event_ids"] == [1017, 1018]
+
+
 @pytest.mark.parametrize("grouped", [False, True])
 def test_no_event_flood_from_256_turns_or_large_round(engine, monkeypatch, grouped):
     events = Events()
@@ -168,7 +210,28 @@ def test_repair_failure_then_success_keeps_identity_status_and_cursor(engine, mo
     row = engine.list_daily_chat_memory_pending()[0]
     assert row["id"] == candidate_id and row["status"] == "pending"
     assert row["candidate"]["source_event_ids"] == [1017, 1018]
+    assert "provenance_detail" not in row["candidate"]
     assert engine._load_daily_chat_memory_cursor() == cursor
+
+
+def test_repair_aligned_candidate_clears_stale_diagnostic_without_realign(engine, monkeypatch):
+    events = Events()
+    model(monkeypatch, engine, {"alignments": [{"candidate_index": 0, "source_turn_refs": [17]}]})
+    candidate_id = run(engine, events)["candidates"][0]["id"]
+    items = engine._load_daily_chat_memory_pending()
+    items[0]["candidate"]["provenance_detail"] = "empty_response"
+    engine._save_daily_chat_memory_pending(items)
+
+    async def should_not_realign(*args, **kwargs):
+        raise AssertionError("already aligned candidate should not re-align just to clear stale diagnostics")
+
+    monkeypatch.setattr(engine, "_align_daily_chat_memory_candidate_sources", should_not_realign)
+    result = asyncio.run(engine.repair_daily_chat_memory_provenance([candidate_id], raw_event_store=events))
+    assert result["aligned"] == 1
+    row = engine.list_daily_chat_memory_pending()[0]
+    assert row["candidate"]["provenance_status"] == "aligned"
+    assert row["candidate"]["source_event_ids"] == [1017]
+    assert "provenance_detail" not in row["candidate"]
 
 
 def test_repair_does_not_overwrite_concurrent_rejection(engine, monkeypatch):
