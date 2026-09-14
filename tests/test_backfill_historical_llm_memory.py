@@ -336,6 +336,61 @@ def test_cross_day_collect_uses_exact_date_range_and_preserves_event_flags(tmp_p
     assert project["projectish"] is True
 
 
+def test_cross_day_collect_resolves_unique_nested_batch_date(tmp_path):
+    stage_parent = tmp_path / "historical_backfill"
+    batch_a = stage_parent / "batch-a"
+    batch_b = stage_parent / "batch-b"
+    _write_staged_output(
+        batch_a,
+        "2026-05-15",
+        "a",
+        [
+            {
+                "title": "第一批",
+                "summary": "来自第一个 bounded batch。",
+                "signals": ["stable_preference"],
+                "source_event_ids": [101],
+                "confidence": 0.9,
+            }
+        ],
+    )
+    _write_staged_output(
+        batch_b,
+        "2026-05-16",
+        "b",
+        [
+            {
+                "title": "第二批",
+                "summary": "来自第二个 bounded batch。",
+                "signals": ["stable_preference"],
+                "source_event_ids": [201],
+                "confidence": 0.9,
+            }
+        ],
+    )
+
+    rows = collect_staged_summaries(stage_parent, "2026-05-15", "2026-05-16")
+    assert [row["date"] for row in rows] == ["2026-05-15", "2026-05-16"]
+    assert rows[0]["source_file"].startswith("batch-a/")
+    assert rows[1]["source_file"].startswith("batch-b/")
+
+
+def test_cross_day_collect_rejects_ambiguous_nested_batch_date(tmp_path):
+    stage_parent = tmp_path / "historical_backfill"
+    summary = {
+        "title": "冲突日期",
+        "summary": "同一日期不应同时存在于两个 bounded batch。",
+        "signals": ["stable_preference"],
+        "source_event_ids": [101],
+        "confidence": 0.9,
+    }
+    _write_staged_output(stage_parent / "batch-a", "2026-05-15", "a", [summary])
+    _write_staged_output(stage_parent / "batch-b", "2026-05-15", "b", [summary])
+
+    with pytest.raises(ValueError, match="ambiguous staged date 2026-05-15"):
+        collect_staged_summaries(stage_parent, "2026-05-15", "2026-05-15")
+
+
 def test_protected_same_scene_adjacent_windows_are_reviewed_together(tmp_path):
     stage_parent = tmp_path / "historical_backfill"
     first = {

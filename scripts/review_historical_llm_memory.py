@@ -173,12 +173,26 @@ def _is_projectish(signals: Iterable[str]) -> bool:
     return False
 
 
+def _resolve_day_root(stage_parent: Path, date_key: str) -> Path:
+    direct = stage_parent / date_key
+    if direct.is_dir():
+        return direct
+
+    nested = sorted(path for path in stage_parent.glob(f"*/{date_key}") if path.is_dir())
+    if len(nested) == 1:
+        return nested[0]
+    if len(nested) > 1:
+        rendered = ", ".join(str(path) for path in nested)
+        raise ValueError(f"ambiguous staged date {date_key}: {rendered}")
+    return direct
+
+
 def collect_staged_summaries(stage_parent: Path, start_date: str, end_date: str) -> list[dict[str, Any]]:
     """Collect validated per-day staging summaries for an exact inclusive range."""
     stage_parent = stage_parent.resolve()
     records: list[dict[str, Any]] = []
     for date_key in _date_keys(start_date, end_date):
-        day_root = stage_parent / date_key
+        day_root = _resolve_day_root(stage_parent, date_key)
         outputs_dir = day_root / "outputs"
         if not outputs_dir.exists():
             raise FileNotFoundError(f"missing outputs directory for {date_key}: {outputs_dir}")
