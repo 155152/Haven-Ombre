@@ -3067,11 +3067,16 @@ async def _enrich_memory_async(bucket_id: str, *, force: bool = False) -> None:
         if is_self_anchor_bucket(bucket):
             logger.debug("Skip self-anchor enrichment / 跳过自我入口关系补全: %s", bucket_id)
             return
+        try:
+            memory_moment_store.upsert_bucket(bucket)
+        except Exception as exc:
+            logger.warning("Memory moment/trigger invalidation refresh failed for %s: %s", bucket_id, exc)
         result = await reflection_engine.enrich_bucket(
             bucket_id,
             bucket_mgr,
             memory_edge_store,
             embedding_engine=embedding_engine,
+            memory_moment_store=memory_moment_store,
             force=force,
         )
         entity_edges = await _refresh_entity_edges_for_bucket_id(bucket_id)
@@ -3712,11 +3717,13 @@ async def _backfill_memory_enrichment(
     reflection_engine_arg=None,
     edge_store_arg=None,
     embedding_engine_arg=None,
+    memory_moment_store_arg=None,
 ) -> dict:
     mgr = bucket_mgr_arg or bucket_mgr
     engine = reflection_engine_arg or reflection_engine
     edge_store = edge_store_arg or memory_edge_store
     emb_engine = embedding_engine_arg or embedding_engine
+    moment_store = memory_moment_store_arg or memory_moment_store
     reflection_cfg = config.get("reflection", {}) if isinstance(config.get("reflection", {}), dict) else {}
     default_limit = _int_between(reflection_cfg.get("enrich_backfill_limit"), 5, 0, 50)
     limit = _int_between(limit, default_limit, 0, 50)
@@ -3747,6 +3754,7 @@ async def _backfill_memory_enrichment(
                 mgr,
                 edge_store,
                 embedding_engine=emb_engine,
+                memory_moment_store=moment_store,
                 force=True,
             )
             if edge_store is memory_edge_store:
@@ -3761,6 +3769,118 @@ async def _backfill_memory_enrichment(
 async def enrich_backfill(limit: int = 10) -> dict:
     """后台补跑缺失的 tags/confidence/memory_edges；主要用于 enrich_on_write 曾经超时或关闭后的修复。"""
     return await _backfill_memory_enrichment(limit=limit)
+
+
+async def _backfill_associative_triggers(
+    limit: int | None = None,
+    *,
+    bucket_id: str = "",
+    query: str = "",
+    dry_run: bool = True,
+    bucket_mgr_arg=None,
+    reflection_engine_arg=None,
+    memory_moment_store_arg=None,
+    embedding_engine_arg=None,
+) -> dict:
+    """Bounded manual trigger backfill; never rewrites canonical memory content."""
+    mgr = bucket_mgr_arg or bucket_mgr
+    engine = reflection_engine_arg or reflection_engine
+    store = memory_moment_store_arg or memory_moment_store
+    emb_engine = embedding_engine_arg or embedding_engine
+    reflection_cfg = config.get("reflection", {}) if isinstance(config.get("reflection", {}), dict) else {}
+    default_limit = _int_between(reflection_cfg.get("associative_trigger_backfill_limit"), 10, 1, 50)
+    limit = 1 if str(bucket_id or "").strip() else _int_between(limit, default_limit, 1, 50)
+    if str(bucket_id or "").strip() or str(query or "").strip():
+        candidates, warnings = await _edge_backfill_candidates(
+            mgr,
+            limit=limit,
+            bucket_id=bucket_id,
+            query=query,
+        )
+    else:
+        warnings = []
+        try:
+            scan = await mgr.list_all(include_archive=False)
+        except Exception as exc:
+            return {
+                "inspected": 0,
+                "updated": 0,
+                "current": 0,
+                "needs_refresh": 0,
+                "dry_run": bool(dry_run),
+                "results": [],
+                "errors": [f"list_failed: {exc}"],
+            }
+        scan.sort(
+            key=lambda item: item.get("metadata", {}).get("updated_at") or item.get("metadata", {}).get("created", ""),
+            reverse=True,
+        )
+        candidates = [bucket for bucket in scan if _bucket_allows_memory_edge_backfill(bucket)]
+    embedding_model = str(getattr(emb_engine, "model", "") or "").strip()
+    results: list[dict] = []
+    errors: list[str] = list(warnings)
+    updated = current = needs_refresh = inspected = 0
+    for bucket in candidates:
+        if inspected >= limit:
+            break
+        current_id = str(bucket.get("id") or "").strip()
+        if not current_id:
+            continue
+        try:
+            source_hash = str(store.associative_source_hash(bucket) or "").strip()
+            existing = store.list_associative_triggers(current_id)
+            state = store.get_associative_trigger_state(current_id)
+            state_status = str(state.get("status") or "").strip().lower()
+            is_current = bool(
+                source_hash
+                and state
+                and str(state.get("source_hash") or "") == source_hash
+                and str(state.get("embedding_model") or "").strip() == embedding_model
+                and state_status in {"ready", "empty"}
+                and (state_status == "empty" or bool(existing))
+            )
+            if is_current:
+                current += 1
+                if str(bucket_id or "").strip() or str(query or "").strip():
+                    inspected += 1
+                    results.append({
+                        "id": current_id,
+                        "status": "current_empty" if state_status == "empty" else "current",
+                        "triggers": len(existing),
+                    })
+                continue
+            inspected += 1
+            needs_refresh += 1
+            if dry_run:
+                results.append({
+                    "id": current_id,
+                    "status": "needs_refresh",
+                    "existing_triggers": len(existing),
+                })
+                continue
+            store.upsert_bucket(bucket)
+            trigger_result = await engine._refresh_associative_triggers(
+                bucket,
+                memory_moment_store=store,
+                embedding_engine=emb_engine,
+                force=False,
+            )
+            trigger_result = dict(trigger_result or {})
+            if trigger_result.get("status") in {"ok", "current", "empty", "current_empty"}:
+                updated += 1
+            results.append({"id": current_id, **trigger_result})
+        except Exception as exc:
+            logger.warning("Associative trigger backfill failed for %s: %s", current_id, exc)
+            errors.append(f"{current_id}: {exc}")
+    return {
+        "inspected": inspected,
+        "updated": updated,
+        "current": current,
+        "needs_refresh": needs_refresh,
+        "dry_run": bool(dry_run),
+        "results": results,
+        "errors": errors,
+    }
 
 
 async def _search_edge_backfill_buckets(mgr, query: str, limit: int) -> list[dict]:
@@ -5005,17 +5125,24 @@ def _source_record_synthetic_moments_for_matches(matches: list[dict], query: str
     return output
 
 
-def _prepend_source_record_synthetic_moments(
+def _merge_source_record_synthetic_moments(
     moments: list[dict],
     synthetics: list[dict],
 ) -> list[dict]:
+    """Keep canonical/direct moments ahead of legacy source evidence containers.
+
+    Source records remain query-matched evidence fallbacks, but they must never be
+    force-prepended ahead of cleaner canonical memories merely because the raw
+    source contains a matching token.
+    """
     if not synthetics:
         return moments
     source_ids = {str(moment.get("bucket_id") or "") for moment in synthetics}
-    return list(synthetics) + [
+    canonical = [
         moment for moment in moments
         if str(moment.get("bucket_id") or "") not in source_ids
     ]
+    return canonical + list(synthetics)
 
 
 def _source_record_fragment_for_query(query: str, bucket: dict, *, max_chars: int = 360) -> str:
@@ -5288,7 +5415,7 @@ def _format_secondary_direct_moment(moment: dict) -> str:
     summary = _diffused_moment_summary(moment)
     return (
         f"- [bucket_id:{moment['bucket_id']}] [moment_id:{moment['moment_id']}] "
-        f"摘要: {summary}（相关命中，来自同一查询语义。）"
+        f"摘要: {summary}（次级直接命中，来自同一查询语义，不是联想扩散。）"
     )
 
 
@@ -6169,7 +6296,7 @@ async def _build_recall_debug_payload(
     )
     direct_candidates = _direct_recallable_moments(searched_candidates, explicit_lookup=explicit_lookup)
     source_record_moments = _source_record_synthetic_moments_for_matches(matches, query)
-    direct_candidates = _prepend_source_record_synthetic_moments(
+    direct_candidates = _merge_source_record_synthetic_moments(
         direct_candidates,
         source_record_moments,
     )
@@ -6186,12 +6313,12 @@ async def _build_recall_debug_payload(
             if str(moment.get("moment_id") or "") not in source_record_by_id
         ],
     )
-    gated_candidates = _prepend_source_record_synthetic_moments(
+    gated_candidates = _merge_source_record_synthetic_moments(
         gated_non_source,
         source_record_moments,
     )
     reranked_candidates = await _rerank_breath_moment_candidates(query, gated_candidates)
-    reranked_candidates = _prepend_source_record_synthetic_moments(
+    reranked_candidates = _merge_source_record_synthetic_moments(
         reranked_candidates,
         source_record_moments,
     )
@@ -7666,7 +7793,7 @@ async def breath(
     )
     moment_candidates = _direct_recallable_moments(moment_candidates, explicit_lookup=explicit_lookup)
     source_record_moments = _source_record_synthetic_moments_for_matches(matches, query)
-    moment_candidates = _prepend_source_record_synthetic_moments(
+    moment_candidates = _merge_source_record_synthetic_moments(
         moment_candidates,
         source_record_moments,
     )
@@ -7683,13 +7810,13 @@ async def breath(
             if str(moment.get("moment_id") or "") not in source_record_by_id
         ],
     )
-    gated_moment_candidates = _prepend_source_record_synthetic_moments(
+    gated_moment_candidates = _merge_source_record_synthetic_moments(
         gated_non_source,
         source_record_moments,
     )
     moment_candidates = gated_moment_candidates
     moment_candidates = await _rerank_breath_moment_candidates(query, moment_candidates)
-    moment_candidates = _prepend_source_record_synthetic_moments(
+    moment_candidates = _merge_source_record_synthetic_moments(
         moment_candidates,
         source_record_moments,
     )
@@ -7778,14 +7905,15 @@ async def breath(
             logger.warning(f"Failed to render direct moment / 直接命中片段渲染失败: {e}")
             continue
 
+    secondary_entry = ""
     related_entry = ""
     secondary_moment_ids: list[str] = []
     related_source_bucket_ids: list[str] = []
     if include_related and returned_moments:
         query_plan = _recall_query_plan(query)
-        related_header = "=== 联想浮现 ===\n"
-        related_budget = max_tokens - token_used - count_tokens_approx(related_header)
-        related_parts = []
+        secondary_header = "=== 次级直接命中 ===\n"
+        secondary_budget = max_tokens - token_used - count_tokens_approx(secondary_header)
+        secondary_parts = []
         secondary_moments = _secondary_direct_moments(
             query,
             returned_moments,
@@ -7795,16 +7923,21 @@ async def breath(
             seed_diagnostics=seed_diagnostics,
         )
         for moment in secondary_moments:
-            if related_budget <= 0:
+            if secondary_budget <= 0:
                 break
             block = _format_secondary_direct_moment(moment)
             block_tokens = count_tokens_approx(block)
-            if block_tokens > related_budget:
+            if block_tokens > secondary_budget:
                 break
-            related_parts.append(block)
+            secondary_parts.append(block)
             secondary_moment_ids.append(str(moment.get("moment_id") or ""))
-            related_budget -= block_tokens
+            secondary_budget -= block_tokens
+        if secondary_parts:
+            secondary_entry = secondary_header + "\n---\n".join(secondary_parts)
+            token_used += count_tokens_approx(secondary_entry)
 
+        related_header = "=== 联想浮现 ===\n"
+        related_budget = max_tokens - token_used - count_tokens_approx(related_header)
         related_source_buckets = []
         seen_source_bucket_ids = set()
         promoted_seed_moments = _promoted_breath_related_seed_moments(
@@ -7842,16 +7975,15 @@ async def breath(
             exclude_bucket_ids={str(moment.get("bucket_id") or "") for moment in secondary_moments},
         )
         if related_block:
-            related_parts.append(related_block)
-        if related_parts:
-            related_entry = related_header + "\n---\n".join(related_parts)
+            related_entry = related_header + related_block
             token_used += count_tokens_approx(related_entry)
 
     drift_entry = ""
     # --- Resurface: when search returns < 3, 40% chance to float dormant memories ---
     # --- 久未触碰浮现：检索结果不足 3 条时，40% 概率漂起旧桶 ---
     if (
-        not related_entry
+        not secondary_entry
+        and not related_entry
         and len(returned_moments) < 3
         and not recall_thresholds.get("has_explicit_entity")
         and _query_resurface_enabled()
@@ -7907,6 +8039,9 @@ async def breath(
     if direct_results:
         response_parts.append("=== 直接命中记忆 ===\n" + "\n---\n".join(direct_results))
         response_sections.append("direct")
+    if secondary_entry:
+        response_parts.append(secondary_entry)
+        response_sections.append("secondary_direct")
     if related_entry:
         response_parts.append(related_entry)
         response_sections.append("related")
@@ -11531,6 +11666,34 @@ async def api_gateway_injections(request):
     )
     status_code = 200 if payload.get("status") == "ok" else 502
     return JSONResponse(payload, status_code=status_code)
+
+
+@mcp.custom_route("/api/associative-triggers/backfill", methods=["POST"])
+async def api_associative_trigger_backfill(request):
+    """Dashboard-authenticated bounded trigger backfill. Dry-run by default."""
+    from starlette.responses import JSONResponse
+    err = _require_dashboard_auth(request)
+    if err:
+        return err
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if body is None:
+        body = {}
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "json body must be an object"}, status_code=400)
+    try:
+        result = await _backfill_associative_triggers(
+            limit=_int_between(body.get("limit"), 10, 1, 50),
+            bucket_id=str(body.get("bucket_id") or ""),
+            query=str(body.get("query") or ""),
+            dry_run=_bool_value(body.get("dry_run"), True),
+        )
+        return JSONResponse(result)
+    except Exception as exc:
+        logger.warning("Associative trigger backfill API failed: %s", exc, exc_info=True)
+        return JSONResponse({"error": str(exc)}, status_code=500)
 
 
 @mcp.custom_route("/api/reflection/run", methods=["POST"])

@@ -110,6 +110,12 @@ class EmbeddingEngine:
             logger.warning(f"Embedding generation failed for {bucket_id}: {e}")
             return False
 
+    async def embed_text(self, text: str, *, kind: str = "document") -> list[float]:
+        """Generate one embedding without storing it; used by auxiliary retrieval indexes."""
+        if not self.enabled or not str(text or "").strip():
+            return []
+        return await self._generate_embedding(text, kind=kind)
+
     async def _generate_embedding(self, text: str, *, kind: str = "document") -> list[float]:
         """Call API to generate embedding vector."""
         # Truncate to avoid token limits

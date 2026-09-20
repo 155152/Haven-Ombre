@@ -218,6 +218,7 @@ DYNAMIC_ANCHOR_CATEGORY_BLOCKED_KINDS = frozenset(
         "affect_anchor",
     }
 )
+RETRIEVAL_ALIAS_ANCHORED_MAX_TERM_BUCKETS = 24
 MEMORY_DETAIL_REQUEST_RE = re.compile(
     r"^\s*\[memory_detail\s+ids\s*=\s*([\"'])(?P<ids>[^\"']+)\1\s*\]\s*",
     re.IGNORECASE,
@@ -566,6 +567,56 @@ class GatewayService:
             self.dynamic_top_k,
             min(200, int(self.gateway_cfg.get("semantic_candidate_top_k", max(50, self.dynamic_top_k)))),
         )
+        self.associative_trigger_enabled = self._bool_config_value(
+            self.gateway_cfg.get("associative_trigger_enabled"),
+            True,
+        )
+        self.associative_trigger_top_k = max(
+            1,
+            min(30, int(self.gateway_cfg.get("associative_trigger_top_k", 8))),
+        )
+        legacy_associative_gate = self.gateway_cfg.get("associative_trigger_gate")
+        self.associative_trigger_strong_gate = max(
+            0.60,
+            min(
+                0.98,
+                float(
+                    self.gateway_cfg.get(
+                        "associative_trigger_strong_gate",
+                        legacy_associative_gate if legacy_associative_gate is not None else 0.72,
+                    )
+                ),
+            ),
+        )
+        self.associative_trigger_soft_gate = max(
+            0.40,
+            min(
+                self.associative_trigger_strong_gate,
+                float(self.gateway_cfg.get("associative_trigger_soft_gate", 0.48)),
+            ),
+        )
+        self.associative_trigger_soft_effective_gate = max(
+            0.40,
+            min(
+                self.associative_trigger_strong_gate,
+                float(self.gateway_cfg.get("associative_trigger_soft_effective_gate", 0.50)),
+            ),
+        )
+        self.associative_trigger_margin = max(
+            0.0,
+            min(0.40, float(self.gateway_cfg.get("associative_trigger_margin", 0.08))),
+        )
+        self.associative_trigger_soft_confidence = max(
+            0.62,
+            min(0.95, float(self.gateway_cfg.get("associative_trigger_soft_confidence", 0.72))),
+        )
+        self.associative_trigger_startup_warm_timeout_seconds = max(
+            3.0,
+            min(
+                30.0,
+                float(self.gateway_cfg.get("associative_trigger_startup_warm_timeout_seconds", 12.0)),
+            ),
+        )
         self.moment_search_limit = max(
             1,
             min(200, int(self.gateway_cfg.get("moment_search_limit", max(50, self.dynamic_top_k * 2)))),
@@ -850,6 +901,9 @@ class GatewayService:
             semantic_vectors = await asyncio.to_thread(warm_semantic)
         semantic_cache_ms = max(0, int((time.perf_counter() - stage_started_at) * 1000))
         stage_started_at = time.perf_counter()
+        associative_query_warmed = await self._warm_associative_query_embedding()
+        associative_query_warm_ms = max(0, int((time.perf_counter() - stage_started_at) * 1000))
+        stage_started_at = time.perf_counter()
         for bucket in all_buckets:
             facets_for_node(self._bucket_relevance_node(bucket), self.relevance_options)
         for moment in moments:
@@ -857,14 +911,17 @@ class GatewayService:
         relevance_facets_ms = max(0, int((time.perf_counter() - stage_started_at) * 1000))
         logger.info(
             "Gateway recall runtime warmed | latency_ms=%s query_plan_ms=%s list_buckets_ms=%s "
-            "moment_graph_ms=%s lexical_profiles_ms=%s semantic_cache_ms=%s relevance_facets_ms=%s buckets=%s "
-            "lexical_buckets=%s semantic_vectors=%s moments=%s edges=%s",
+            "moment_graph_ms=%s lexical_profiles_ms=%s semantic_cache_ms=%s associative_query_warm_ms=%s "
+            "associative_query_warmed=%s relevance_facets_ms=%s buckets=%s lexical_buckets=%s semantic_vectors=%s "
+            "moments=%s edges=%s",
             max(0, int((time.perf_counter() - started_at) * 1000)),
             query_plan_ms,
             list_buckets_ms,
             moment_graph_ms,
             lexical_profiles_ms,
             semantic_cache_ms,
+            associative_query_warm_ms,
+            associative_query_warmed,
             relevance_facets_ms,
             len(all_buckets),
             lexical_buckets,
@@ -2236,6 +2293,30 @@ class GatewayService:
             }
         )
 
+    def _hook_recall_route_plan(self, query: str) -> dict[str, Any]:
+        plan = self._recall_query_plan(query)
+        if getattr(plan, "skip_long_term_recall", False):
+            return {
+                "route": "skip",
+                "search_depth": "none",
+                "recall_mode": "fast",
+                "admission_mode": "none",
+                "skip_reason": str(getattr(plan, "skip_reason", "") or "long_term_recall_skip"),
+            }
+        explicit = bool(
+            getattr(plan, "explicit_old_memory", False)
+            or self.recall_policy.is_detail_read_query(query)
+            or self._query_requests_direct_detail(query)
+            or self._query_requests_date_recall(query)
+        )
+        return {
+            "route": "explicit" if explicit else "implicit",
+            "search_depth": "deep" if explicit else "shallow",
+            "recall_mode": "full" if explicit else "fast",
+            "admission_mode": "full" if explicit else "light",
+            "skip_reason": "",
+        }
+
     async def handle_hook_recall(self, request: Request) -> JSONResponse:
         auth_result = self._authorize(request.headers.get("Authorization", ""))
         if auth_result is not None:
@@ -2311,11 +2392,11 @@ class GatewayService:
         allow_rerank = self._truthy_header(
             str(body.get("allow_rerank")) if body.get("allow_rerank") is not None else None
         )
-        recall_mode = str(body.get("recall_mode") or "fast").strip().lower()
-        if recall_mode in {"gateway", "parity"}:
-            recall_mode = "full"
-        if recall_mode not in {"fast", "full"}:
-            return JSONResponse({"error": "recall_mode must be fast or full"}, status_code=400)
+        requested_recall_mode = str(body.get("recall_mode") or "fast").strip().lower()
+        if requested_recall_mode in {"gateway", "parity"}:
+            requested_recall_mode = "full"
+        if requested_recall_mode not in {"auto", "fast", "full"}:
+            return JSONResponse({"error": "recall_mode must be auto, fast or full"}, status_code=400)
         max_context_chars = bounded_int(
             body.get("max_context_chars"),
             default=4200,
@@ -2324,12 +2405,49 @@ class GatewayService:
         )
         current_turn_id = str(body.get("current_turn_id") or "").strip()
         current_source_event_id = str(body.get("current_source_event_id") or "").strip()
-        focused_full = self._truthy_header(
-            str(body.get("focused_full")) if body.get("focused_full") is not None else None
-        )
-        admission_mode = str(body.get("admission_mode") or "").strip().lower()
+        route_plan = self._hook_recall_route_plan(query) if requested_recall_mode == "auto" else {}
+        recall_mode = str(route_plan.get("recall_mode") or requested_recall_mode)
+        admission_mode = str(route_plan.get("admission_mode") or body.get("admission_mode") or "").strip().lower()
         if admission_mode not in {"none", "light", "full"}:
             admission_mode = "full" if recall_mode == "full" else "light"
+        focused_full = (
+            recall_mode == "full"
+            and not self._query_requests_date_recall(query)
+            if requested_recall_mode == "auto"
+            else self._truthy_header(
+                str(body.get("focused_full")) if body.get("focused_full") is not None else None
+            )
+        )
+        if requested_recall_mode == "auto":
+            deep_search = str(route_plan.get("search_depth") or "") == "deep"
+            allow_semantic = deep_search
+            allow_query_planner = deep_search
+            allow_semantic_session_dedupe = True
+            allow_rerank = deep_search
+            if not deep_search:
+                max_cards = min(1, max_cards)
+                max_chars = min(320, max_chars)
+            if str(route_plan.get("route") or "") == "skip":
+                debug = {
+                    "mode": "auto_skip",
+                    "recall_route": "skip",
+                    "search_depth": "none",
+                    "admission_mode": "none",
+                    "skip_reason": str(route_plan.get("skip_reason") or "long_term_recall_skip"),
+                    "candidate_count": 0,
+                }
+                return JSONResponse(
+                    {
+                        "ok": True,
+                        "query": query,
+                        "session_id": session_id,
+                        "cards": [],
+                        "notes": [],
+                        "additional_context": "",
+                        "recalled_ids": [],
+                        "debug": debug,
+                    }
+                )
 
         if recall_mode == "full":
             return await self._handle_hook_recall_full(
@@ -2346,6 +2464,8 @@ class GatewayService:
                 current_turn_id=current_turn_id,
                 current_source_event_id=current_source_event_id,
                 focused_full=focused_full,
+                recall_route=str(route_plan.get("route") or ""),
+                search_depth=str(route_plan.get("search_depth") or ""),
             )
 
         try:
@@ -2372,6 +2492,12 @@ class GatewayService:
             "domains": list(domain_debug.get("domains") or []),
             "query": str(domain_debug.get("query") or hook_debug.get("search_query") or query),
             "candidate_count": int(hook_debug.get("candidate_count") or len(cards or [])),
+            "recall_route": str(route_plan.get("route") or ("implicit" if admission_mode == "light" else "explicit")),
+            "search_depth": str(route_plan.get("search_depth") or ("shallow" if recall_mode == "fast" else "deep")),
+            "admission_mode": admission_mode,
+            "associative_candidate_count": int(hook_debug.get("associative_candidate_count") or 0),
+            "associative_selected_count": int(hook_debug.get("associative_selected_count") or 0),
+            "associative_top_score": self._safe_float(hook_debug.get("associative_top_score"), 0.0),
             "snowflake_boosted": [],
         }
         response: dict[str, Any] = {
@@ -2404,6 +2530,151 @@ class GatewayService:
             response["debug"] = {**debug, **minimal_debug}
         return JSONResponse(response)
 
+    async def _hook_recall_focused_cards(
+        self,
+        query: str,
+        session_id: str,
+        *,
+        max_cards: int,
+        max_chars: int,
+    ) -> tuple[list[dict[str, Any]], list[str], dict[str, Any]]:
+        query_plan = self._recall_query_plan(query)
+        allow_archive = bool(getattr(query_plan, "allow_archive_targets", False))
+        if max_cards <= 0:
+            return [], [], {
+                "hook_recall_debug": {
+                    "mode": "focused_direct_candidates_unified",
+                    "candidate_count": 0,
+                    "direct_scan_hit": False,
+                    "archive_targets_allowed": allow_archive,
+                    "skip_reason": "max_cards_zero",
+                },
+            }
+        all_buckets = await self._list_gateway_buckets(include_archive=allow_archive)
+        canonical_buckets = [
+            bucket for bucket in all_buckets
+            if not self._is_source_record_bucket(bucket)
+        ]
+        source_record_buckets = [
+            bucket for bucket in all_buckets
+            if self._is_source_record_bucket(bucket)
+        ]
+        locatable_terms = list(dict.fromkeys(
+            str(term).strip()
+            for term in (getattr(query_plan, "locatable_terms", ()) or ())
+            if str(term).strip() and self._compact_lookup_key(term)
+        ))
+        locatable_keys = [
+            self._compact_lookup_key(term)
+            for term in locatable_terms
+        ]
+        entity_anchor_terms = list(
+            getattr(query_plan, "entity_anchor_terms", ()) or ()
+        )
+        required_locatable_keys = list(dict.fromkeys(
+            self._compact_lookup_key(term)
+            for term in entity_anchor_terms
+            if self._compact_lookup_key(term)
+        ))
+
+        def direct_match(bucket: dict[str, Any]) -> bool:
+            if locatable_keys:
+                metadata = bucket.get("metadata") if isinstance(bucket.get("metadata"), dict) else {}
+                bucket_key = self._compact_lookup_key(
+                    " ".join(
+                        [
+                            str(metadata.get("name") or bucket.get("name") or ""),
+                            bucket_content_for_recall(bucket),
+                        ]
+                    )
+                )
+                if required_locatable_keys:
+                    return any(key and key in bucket_key for key in required_locatable_keys)
+                return any(key and key in bucket_key for key in locatable_keys)
+            return self._hook_bucket_has_strong_topic_evidence(
+                query,
+                bucket,
+                allow_signal=False,
+            )
+
+        direct_candidates = [
+            bucket
+            for bucket in canonical_buckets
+            if direct_match(bucket)
+        ]
+        source_record_fallback = False
+        if not direct_candidates:
+            source_record_fallback = True
+            direct_candidates = [
+                bucket
+                for bucket in source_record_buckets
+                if direct_match(bucket)
+            ]
+
+        selected_buckets: list[dict[str, Any]] = []
+        suppressed_buckets: list[dict[str, Any]] = []
+        planner_debug: dict[str, Any] = {"final_bucket_ids": []}
+        if direct_candidates:
+            selected_buckets, suppressed_buckets, planner_debug = await self._select_dynamic_buckets(
+                query,
+                session_id,
+                direct_candidates,
+                search_query=self._normalized_recall_query(query),
+                include_query_planner_debug=True,
+                allow_semantic=False,
+                allow_query_planner=False,
+                allow_associative=False,
+                allow_archived_candidates=True,
+                allow_semantic_session_dedupe=True,
+                allow_rerank=False,
+                allow_expansion=False,
+            )
+
+        cards: list[dict[str, Any]] = []
+        recalled_ids: list[str] = []
+        seen_ids: set[str] = set()
+        for bucket in selected_buckets:
+            if len(cards) >= max_cards:
+                break
+            card = self._hook_recall_card_from_bucket(
+                bucket,
+                query=query,
+                max_chars=max_chars,
+            )
+            if not card:
+                continue
+            bucket_id = str(card.get("bucket_id") or "")
+            if not bucket_id or bucket_id in seen_ids:
+                continue
+            seen_ids.add(bucket_id)
+            recalled_ids.append(bucket_id)
+            cards.append(card)
+
+        return cards, recalled_ids, {
+            "query_planner_debug": planner_debug,
+            "recalled_bucket_ids": list(recalled_ids),
+            "recalled_bucket_debug": [
+                self._format_selected_bucket_debug(bucket, query=query)
+                for bucket in (selected_buckets or [])[:20]
+            ],
+            "suppressed_bucket_candidates": [
+                self._format_suppressed_bucket_debug(item, query=query)
+                for item in (suppressed_buckets or [])[:20]
+            ],
+            "hook_recall_debug": {
+                "mode": "focused_direct_candidates_unified",
+                "candidate_count": len(direct_candidates),
+                "direct_scan_hit": bool(cards),
+                "archive_targets_allowed": allow_archive,
+                "source_record_fallback": source_record_fallback,
+                "canonical_scan_count": len(canonical_buckets),
+                "source_record_scan_count": len(source_record_buckets) if source_record_fallback else 0,
+                "focused_locatable_terms": list(locatable_terms),
+                "focused_entity_anchor_terms": list(entity_anchor_terms),
+                "focused_required_locatable_keys": list(required_locatable_keys),
+            },
+        }
+
     async def _handle_hook_recall_full(
         self,
         *,
@@ -2420,103 +2691,104 @@ class GatewayService:
         current_turn_id: str = "",
         current_source_event_id: str = "",
         focused_full: bool = False,
+        recall_route: str = "",
+        search_depth: str = "",
     ) -> JSONResponse:
         """Run the normal Gateway recall pipeline without forwarding upstream."""
         if focused_full:
             try:
-                all_buckets = await self._list_gateway_buckets(include_archive=False)
-                direct_candidates = [
-                    bucket
-                    for bucket in all_buckets
-                    if self._hook_bucket_has_strong_topic_evidence(
-                        query,
-                        bucket,
-                        allow_signal=False,
-                    )
-                ]
-                direct_candidates.sort(
-                    key=lambda bucket: self._hook_focused_bucket_rank(query, bucket),
-                    reverse=True,
+                focused_query_plan = self._recall_query_plan(query)
+                focused_cards, focused_ids, focused_debug = await self._hook_recall_focused_cards(
+                    query,
+                    session_id,
+                    max_cards=max_cards,
+                    max_chars=max_chars,
                 )
-                focused_cards: list[dict[str, Any]] = []
-                focused_ids: list[str] = []
-                for bucket in direct_candidates:
-                    card = self._hook_recall_card_from_bucket(
-                        bucket,
-                        query=query,
-                        max_chars=max_chars,
-                    )
-                    if not card:
-                        continue
-                    bucket_id = str(card.get("bucket_id") or "")
-                    if not bucket_id:
-                        continue
-                    focused_cards = [card]
-                    focused_ids = [bucket_id]
-                    break
-                focused_debug = {
-                    "hook_recall_debug": {
-                        "mode": "focused_direct_bucket",
-                        "candidate_count": len(direct_candidates),
-                        "direct_scan_hit": bool(focused_cards),
-                    }
-                }
-                if not focused_cards:
-                    focused_cards, focused_ids, focused_debug = await self._hook_recall_fast_cards(
+                direct_hook_debug = (focused_debug or {}).get("hook_recall_debug") or {}
+                deep_fallback_used = False
+                if not focused_cards and max_cards > 0:
+                    deep_fallback_used = True
+                    focused_cards, focused_ids, fallback_debug = await self._hook_recall_fast_cards(
                         query,
                         session_id,
-                        max_cards=min(1, max_cards),
+                        max_cards=max_cards,
                         max_chars=max_chars,
                         include_diffused=False,
                         allow_semantic=True,
                         allow_query_planner=True,
                         allow_semantic_session_dedupe=True,
-                        allow_rerank=False,
+                        allow_rerank=True,
                         admission_mode="full",
                         require_direct_topic=True,
+                        include_archive=bool(getattr(focused_query_plan, "allow_archive_targets", False)),
                     )
+                    fallback_hook_debug = (fallback_debug or {}).get("hook_recall_debug") or {}
+                    focused_debug = {
+                        **dict(fallback_debug or {}),
+                        "focused_direct_debug": dict(focused_debug or {}),
+                        "hook_recall_debug": {
+                            **dict(fallback_hook_debug),
+                            "focused_direct_candidate_count": int(direct_hook_debug.get("candidate_count") or 0),
+                            "focused_direct_scan_hit": bool(direct_hook_debug.get("direct_scan_hit")),
+                            "deep_fallback_used": True,
+                        },
+                    }
+                else:
+                    focused_debug = {
+                        **dict(focused_debug or {}),
+                        "hook_recall_debug": {
+                            **dict(direct_hook_debug),
+                            "focused_direct_candidate_count": int(direct_hook_debug.get("candidate_count") or 0),
+                            "focused_direct_scan_hit": bool(focused_cards),
+                            "deep_fallback_used": False,
+                        },
+                    }
             except ValueError as exc:
                 return JSONResponse({"error": str(exc)}, status_code=400)
             except RuntimeError as exc:
                 return JSONResponse({"error": str(exc)}, status_code=503)
-            if focused_cards:
-                dynamic_context = self._clip_text(
-                    self._hook_recall_full_dynamic_context(
-                        {},
-                        include_diffused=False,
-                        cards=focused_cards,
-                    ),
-                    max_context_chars,
-                )
-                additional_context = self._render_hook_recall_full_additional_context(dynamic_context)
-                hook_debug = (focused_debug or {}).get("hook_recall_debug") or {}
-                minimal_debug = {
-                    "mode": "full_focused",
-                    "query": query,
-                    "candidate_count": int(hook_debug.get("candidate_count") or len(focused_cards)),
-                    "recalled_bucket_ids": list(focused_ids or []),
-                    "diffused_bucket_ids": [],
-                    "just_now_context_injected": False,
-                    "date_recall_injected": False,
-                    "recent_context_injected": False,
-                    "recent_context_reason": "",
-                    "focused_full_hit": True,
-                    "prepare_timing_debug": {},
-                }
-                response: dict[str, Any] = {
-                    "ok": True,
-                    "query": query,
-                    "session_id": session_id,
-                    "cards": focused_cards,
-                    "notes": focused_cards,
-                    "additional_context": additional_context,
-                    "recalled_ids": list(focused_ids or []),
-                    "debug": minimal_debug,
-                }
-                if include_debug:
-                    debug = dict(focused_debug or {})
-                    response["debug"] = {**debug, **minimal_debug}
-                return JSONResponse(response)
+            dynamic_context = self._clip_text(
+                self._hook_recall_full_dynamic_context(
+                    {},
+                    include_diffused=False,
+                    cards=focused_cards,
+                ),
+                max_context_chars,
+            )
+            additional_context = self._render_hook_recall_full_additional_context(dynamic_context)
+            hook_debug = (focused_debug or {}).get("hook_recall_debug") or {}
+            minimal_debug = {
+                "mode": "full_unified",
+                "query": query,
+                "candidate_count": int(hook_debug.get("candidate_count") or len(focused_cards)),
+                "recall_route": recall_route or "explicit",
+                "search_depth": search_depth or "deep",
+                "admission_mode": "full",
+                "recalled_bucket_ids": list(focused_ids or []),
+                "diffused_bucket_ids": [],
+                "just_now_context_injected": False,
+                "date_recall_injected": False,
+                "recent_context_injected": False,
+                "recent_context_reason": "",
+                "focused_full_hit": bool(focused_cards),
+                "focused_direct_scan_hit": bool(hook_debug.get("focused_direct_scan_hit")),
+                "deep_fallback_used": bool(hook_debug.get("deep_fallback_used")),
+                "prepare_timing_debug": {},
+            }
+            response: dict[str, Any] = {
+                "ok": True,
+                "query": query,
+                "session_id": session_id,
+                "cards": focused_cards,
+                "notes": focused_cards,
+                "additional_context": additional_context,
+                "recalled_ids": list(focused_ids or []),
+                "debug": minimal_debug,
+            }
+            if include_debug:
+                debug = dict(focused_debug or {})
+                response["debug"] = {**debug, **minimal_debug}
+            return JSONResponse(response)
 
         try:
             _forward_payload, recalled_ids, debug_payload = await self.prepare_payload(
@@ -2556,6 +2828,9 @@ class GatewayService:
             "query": query,
             "candidate_count": len(debug_payload.get("recalled_moment_debug") or [])
             + len(debug_payload.get("suppressed_candidates") or []),
+            "recall_route": recall_route or "explicit",
+            "search_depth": search_depth or "deep",
+            "admission_mode": "full",
             "recalled_bucket_ids": list(debug_payload.get("recalled_bucket_ids") or []),
             "diffused_bucket_ids": list(debug_payload.get("diffused_bucket_ids") or []),
             "just_now_context_injected": bool(debug_payload.get("just_now_context_injected")),
@@ -2902,6 +3177,7 @@ class GatewayService:
         query_planner_debug: dict[str, Any] = self._query_planner_debug_base(current_user_query)
         memory_sentinel_debug: dict[str, Any] = self._memory_sentinel_debug_base(current_user_query)
         domain_sentinel_debug: dict[str, Any] = self._domain_sentinel_rule_plan(current_user_query)
+        domain_sentinel_recall_mode = "search"
         skip_broad_dynamic_recall = False
         date_persona_trace_requested = False
 
@@ -2939,12 +3215,15 @@ class GatewayService:
                 stage_started_at = time.perf_counter()
                 domain_sentinel_debug = await self._route_domain_sentinel(current_user_query)
                 mark_step("domain_sentinel", stage_started_at)
-                domain_sentinel_skip_broad = self._domain_sentinel_should_skip_recall(
+                domain_sentinel_recall_mode = self._domain_sentinel_recall_mode(
                     domain_sentinel_debug,
                     current_user_query,
                 )
+                domain_sentinel_skip_broad = domain_sentinel_recall_mode == "hard_skip"
             if domain_sentinel_skip_broad:
                 domain_sentinel_debug["skip_applied"] = True
+            elif domain_sentinel_recall_mode == "implicit":
+                domain_sentinel_debug["implicit_evidence_only"] = True
             skip_broad_dynamic_recall = (
                 pre_domain_skip_broad
                 or domain_sentinel_skip_broad
@@ -3075,6 +3354,7 @@ class GatewayService:
                     suppressed_buckets = []
                 elif self.retrieval_mode == "bucket":
                     stage_started_at = time.perf_counter()
+                    implicit_evidence_only = domain_sentinel_recall_mode == "implicit"
                     selected_buckets, suppressed_buckets, query_planner_debug = await self._select_dynamic_buckets(
                         current_user_query,
                         session_id,
@@ -3084,6 +3364,9 @@ class GatewayService:
                             memory_sentinel_debug,
                         ),
                         include_query_planner_debug=True,
+                        allow_semantic=not implicit_evidence_only,
+                        allow_query_planner=not implicit_evidence_only,
+                        allow_expansion=not implicit_evidence_only,
                     )
                     mark_step("dynamic_recall_bucket_select", stage_started_at)
                     stage_started_at = time.perf_counter()
@@ -9719,8 +10002,6 @@ class GatewayService:
                 ]
             if recalled_rows:
                 for item in recalled_rows:
-                    if self._session_debug_row_has_strong_evidence(item):
-                        continue
                     excluded.add(str(item.get("bucket_id") or "").strip())
                 continue
             for bucket_id in payload.get("recalled_bucket_ids") or []:
@@ -9770,29 +10051,46 @@ class GatewayService:
             rerank_score=scores.get("rerank"),
         )
 
+    def _query_allows_recent_recall_repeat(self, query: str) -> bool:
+        plan = self._recall_query_plan(query)
+        return bool(
+            getattr(plan, "explicit_old_memory", False)
+            or self.recall_policy.is_detail_read_query(query)
+            or self._query_requests_direct_detail(query)
+            or self._query_requests_date_recall(query)
+        )
+
+    def _bucket_repeat_bypass_has_direct_evidence(self, query: str, item: dict) -> bool:
+        labels = set(
+            self._hard_bucket_evidence_labels(
+                self._bucket_evidence_labels(query, item)
+            )
+        )
+        return bool(
+            labels
+            & {
+                "protected_phrase",
+                "exact_anchor",
+                "entity_match",
+                "keyword_match",
+                "distinctive_anchor",
+                "identity_name_match",
+                "source_record_exact",
+                "taste_evidence",
+                "title_anchor",
+                "retrieval_alias_anchor",
+                "semantic_rescue_direct_span",
+            }
+        )
+
     def _session_hard_exclude_bucket_bypass(self, query: str, item: dict) -> bool:
         bucket = item.get("bucket") if isinstance(item, dict) else None
         bucket_id = str((bucket or {}).get("id") or "")
         if bucket_id and bucket_id in self._extract_explicit_bucket_ids_from_text(query):
             return True
-        if self._query_requests_direct_detail(query):
-            return True
-        if (
-            self._planner_lexical_direct_signal(item)
-            or item.get("exact_anchor_match")
-            or item.get("distinctive_anchor_match")
-            or item.get("category_overview_item")
-        ):
-            return True
-        if self.recall_policy.has_strong_score(
-            semantic_score=item.get("semantic_score"),
-            rerank_score=item.get("rerank_score"),
-        ):
-            return True
-        return self._is_high_confidence_match(
-            self._safe_float(item.get("semantic_score"), 0.0),
-            self._safe_float(item.get("keyword_score"), 0.0),
-        )
+        if not self._query_allows_recent_recall_repeat(query):
+            return False
+        return self._bucket_repeat_bypass_has_direct_evidence(query, item)
 
     def _session_hard_exclude_moment_bypass(self, query: str, moment: dict) -> bool:
         bucket_id = str(moment.get("bucket_id") or "")
@@ -9801,26 +10099,16 @@ class GatewayService:
             return True
         if moment_id and moment_id in self._extract_explicit_moment_ids_from_text(query):
             return True
-        if self._query_requests_direct_detail(query):
-            return True
+        if not self._query_allows_recent_recall_repeat(query):
+            return False
         if self._is_source_record_fragment_seed(moment):
             return True
-        if (
+        return bool(
             self._planner_lexical_direct_signal(moment)
             or moment.get("exact_anchor_match")
             or moment.get("distinctive_anchor_match")
-            or moment.get("category_overview_item")
-        ):
-            return True
-        if str(moment.get("admission_reason") or moment.get("_admission_reason") or "") in {
-            "strong_semantic",
-            "strong_rerank",
-            "high_confidence_direct_edge",
-        }:
-            return True
-        return self.recall_policy.has_strong_score(
-            semantic_score=moment.get("semantic_score"),
-            rerank_score=moment.get("rerank_score"),
+            or "title_anchor" in self._debug_str_list(moment.get("hard_evidence_labels"))
+            or "retrieval_alias_anchor" in self._debug_str_list(moment.get("hard_evidence_labels"))
         )
 
     def _session_hard_exclude_diffusion_bypass(self, query: str, moment: dict) -> bool:
@@ -9830,8 +10118,8 @@ class GatewayService:
             return True
         if moment_id and moment_id in self._extract_explicit_moment_ids_from_text(query):
             return True
-        if self._query_requests_direct_detail(query):
-            return True
+        if not self._query_allows_recent_recall_repeat(query):
+            return False
         return self._is_source_record_fragment_seed(moment)
 
     @staticmethod
@@ -9906,8 +10194,6 @@ class GatewayService:
                 ]
             if recalled_rows:
                 for item in recalled_rows:
-                    if self._session_debug_row_has_strong_evidence(item):
-                        continue
                     add_bucket_id(item.get("bucket_id"))
             else:
                 for bucket_id in payload.get("recalled_bucket_ids") or []:
@@ -9925,16 +10211,9 @@ class GatewayService:
         bucket_id = str((bucket or {}).get("id") or "")
         if bucket_id and bucket_id in self._extract_explicit_bucket_ids_from_text(query):
             return True
-        if self._query_requests_direct_detail(query) or self.recall_policy.is_detail_read_query(query):
-            return True
-        if (
-            self._planner_lexical_direct_signal(item)
-            or item.get("exact_anchor_match")
-            or item.get("distinctive_anchor_match")
-            or item.get("category_overview_item")
-        ):
-            return True
-        return self._is_source_record_bucket(bucket)
+        if not self._query_allows_recent_recall_repeat(query):
+            return False
+        return self._bucket_repeat_bypass_has_direct_evidence(query, item)
 
     async def _filter_semantic_session_deduped_bucket_items(
         self,
@@ -13669,7 +13948,7 @@ class GatewayService:
                         "primary_domain must be one of: relationship, intimacy, life, tech, project, general. "
                         "domains is optional but if present must use only those same domain keys. "
                         "First decide whether the message is an automatic trigger/status payload or a troubleshooting/debugging message; if so set message_type accordingly and should_recall=false. "
-                        "For ordinary chat without a locatable memory need, set should_recall=false. "
+                        "For ordinary chat without an explicit need for broad semantic/history search, set message_type=ordinary_chat and should_recall=false. This does NOT mean direct lexical, exact-anchor, or associative memory evidence is irrelevant; the caller may still run a bounded implicit-evidence lookup. "
                         "For explicit recall, detail-read, date recall, or named-entity questions, set message_type=recall_request and should_recall=true. "
                         "Use intimacy only for clearly intimate/body/desire content; otherwise use relationship for relationship anchors, signals, symbols, and communication."
                     ),
@@ -13756,13 +14035,18 @@ class GatewayService:
             return {}
         should_recall = self._parse_sentinel_bool(raw.get("should_recall"))
         message_type = self._parse_domain_sentinel_message_type(raw.get("message_type"))
+        recall_route = ""
+        if should_recall is True:
+            recall_route = "search"
+        elif should_recall is False:
+            recall_route = "skip" if message_type in {"auto_trigger", "troubleshooting"} else "implicit"
         return {
             "domains": domains[:4],
             "primary_domain": domains[0],
             "query": self._clip_text(str(raw.get("query") or "").strip(), 220),
             "confidence": self._clamp(self._safe_float(raw.get("confidence"), 0.0)),
             "should_recall": should_recall,
-            "recall_route": "skip" if should_recall is False else "search" if should_recall is True else "",
+            "recall_route": recall_route,
             "message_type": message_type,
             "reason": self._clip_text(str(raw.get("reason") or "").strip(), 160),
         }
@@ -13800,19 +14084,31 @@ class GatewayService:
             return text
         return "other"
 
-    def _domain_sentinel_should_skip_recall(self, debug: dict[str, Any] | None, query: str = "") -> bool:
-        if not isinstance(debug, dict):
-            return False
+    def _domain_sentinel_recall_mode(self, debug: dict[str, Any] | None, query: str = "") -> str:
+        """Return search, implicit, or hard_skip without conflating ordinary chat with no-memory."""
         if query and self._domain_sentinel_query_explicitly_needs_memory(query):
-            return False
-        if debug.get("should_recall") is not False:
-            return False
+            return "search"
+        if not isinstance(debug, dict):
+            return "search"
+        should_recall = debug.get("should_recall")
+        route = str(debug.get("recall_route") or "").strip().lower()
+        if should_recall is True or route in {"search", "recall"}:
+            return "search"
+        if should_recall is not False:
+            return "search"
         confidence = self._clamp(self._safe_float(debug.get("confidence"), 0.0))
         if confidence < 0.55:
-            return False
-        if str(debug.get("recall_route") or "").strip().lower() in {"search", "recall"}:
-            return False
-        return True
+            return "search"
+        message_type = self._parse_domain_sentinel_message_type(debug.get("message_type"))
+        if message_type in {"auto_trigger", "troubleshooting"} or route in {"hard_skip"}:
+            return "hard_skip"
+        # Ordinary relationship/life chat is exactly where implicit long-term memory can
+        # matter without the user explicitly asking to remember. Keep this evidence-only:
+        # broad semantic/planner expansion is disabled by callers in implicit mode.
+        return "implicit"
+
+    def _domain_sentinel_should_skip_recall(self, debug: dict[str, Any] | None, query: str = "") -> bool:
+        return self._domain_sentinel_recall_mode(debug, query) == "hard_skip"
 
     @staticmethod
     def _is_sentinel_rejected_domain(value: Any) -> bool:
@@ -14304,6 +14600,8 @@ class GatewayService:
                 list(group) for group in (getattr(plan, "activated_axis_groups", ()) or ())
             ],
             "activated_axis_multi": bool(getattr(plan, "activated_axis_multi", False)),
+            "excluded_axis_terms": list(getattr(plan, "excluded_axis_terms", ()) or ()),
+            "axis_polarity": dict(getattr(plan, "axis_polarity_debug", {}) or {}),
             "specific_terms": list(getattr(plan, "specific_terms", ()) or ()),
         }
 
@@ -15218,6 +15516,7 @@ class GatewayService:
                     "alias_text": str(row.get("alias_text") or ""),
                     "source": str(row.get("source") or ""),
                     "bucket_count": max(1, int(row.get("bucket_count") or 1)),
+                    "matched_term_bucket_count": max(1, int(row.get("matched_term_bucket_count") or 1)),
                     "score": self._clamp(self._safe_float(row.get("score"), 0.0)),
                     "matched_terms": self._debug_str_list(row.get("matched_terms")),
                 }
@@ -15512,6 +15811,14 @@ class GatewayService:
                 (max(1, int(row.get("bucket_count") or 1)) for row in alias_hits or []),
                 default=0,
             ),
+            "retrieval_alias_term_bucket_count": min(
+                (
+                    max(1, int(row.get("matched_term_bucket_count") or 1))
+                    for row in alias_hits or []
+                    if int(row.get("matched_term_bucket_count") or 0) > 0
+                ),
+                default=0,
+            ),
         }
 
     def _dynamic_anchor_node_payload(self, node: dict, plan: dict[str, Any]) -> dict[str, Any]:
@@ -15579,6 +15886,7 @@ class GatewayService:
                     "sources": list(item.get("retrieval_alias_sources") or []),
                     "moment_ids": list(item.get("retrieval_alias_moment_ids") or []),
                     "bucket_count": int(item.get("retrieval_alias_bucket_count") or 0),
+                    "term_bucket_count": int(item.get("retrieval_alias_term_bucket_count") or 0),
                     "admission_reason": str(item.get("admission_reason") or ""),
                 }
             )
@@ -15655,6 +15963,9 @@ class GatewayService:
         required_terms: list[str] | None = None,
         planner_query: dict[str, Any] | None = None,
         allow_semantic: bool = True,
+        allow_associative: bool = True,
+        allow_archived_candidates: bool = False,
+        associative_query_embedding: list[float] | None = None,
         allow_semantic_session_dedupe: bool = True,
         allow_rerank: bool = True,
         context_query: str = "",
@@ -15696,6 +16007,11 @@ class GatewayService:
                 (
                     self._is_dynamic_candidate(bucket)
                     or self._is_identity_name_candidate_bucket(raw_query, bucket)
+                    or (
+                        allow_archived_candidates
+                        and str(((bucket.get("metadata") or {}).get("type") or "")).strip().lower() == "archived"
+                        and not self._is_self_anchor_recall_excluded_bucket(bucket)
+                    )
                 )
                 and not self._is_relevance_suppressed(policy_query, bucket)
             )
@@ -15781,12 +16097,31 @@ class GatewayService:
         else:
             semantic_scores = {}
         mark("semantic_candidates", stage_started_at)
+        stage_started_at = time.perf_counter()
+        associative_trigger_hits = (
+            await self._get_associative_trigger_candidates(
+                raw_query,
+                set(alias_eligible_map),
+                query_embedding=associative_query_embedding,
+            )
+            if allow_associative
+            else {}
+        )
+        mark("associative_trigger_candidates", stage_started_at)
+        associative_trigger_scores = {
+            bucket_id: self._clamp(self._safe_float(payload.get("effective_score"), 0.0))
+            for bucket_id, payload in associative_trigger_hits.items()
+        }
         bucket_map = dict(eligible_map)
         for bucket_id in semantic_scores:
             bucket = semantic_bucket_map.get(bucket_id)
             if bucket:
                 bucket_map[bucket_id] = bucket
         for bucket_id in retrieval_alias_scores:
+            bucket = alias_eligible_map.get(bucket_id)
+            if bucket:
+                bucket_map[bucket_id] = bucket
+        for bucket_id in associative_trigger_scores:
             bucket = alias_eligible_map.get(bucket_id)
             if bucket:
                 bucket_map[bucket_id] = bucket
@@ -15828,6 +16163,7 @@ class GatewayService:
             | lexical_ids
             | set(word_map_scores)
             | set(retrieval_alias_scores)
+            | set(associative_trigger_scores)
         )
         all_bucket_ids = {
             str(bucket.get("id") or "")
@@ -15877,6 +16213,8 @@ class GatewayService:
             word_map_score = self._clamp(word_map_scores.get(bucket_id, 0.0))
             entity_edge = entity_edge_boosts.get(bucket_id) or {}
             entity_edge_score = self._clamp(entity_edge.get("score") or 0.0)
+            associative_trigger = associative_trigger_hits.get(bucket_id) or {}
+            associative_trigger_score = self._clamp(associative_trigger_scores.get(bucket_id, 0.0))
             word_map_item_debug = word_map_debug.get(bucket_id) or {}
             rare_name_terms = list(word_map_item_debug.get("rare_name_terms") or [])
             rare_name_match = bool(rare_name_terms)
@@ -15974,6 +16312,20 @@ class GatewayService:
                 final_score = round(fusion_score * cooldown_multiplier, 4)
             if entity_edge_score > 0:
                 final_score = round(self._clamp(final_score + min(0.08, entity_edge_score * 0.08)), 4)
+            if associative_trigger_score > 0:
+                associative_rank_floor = self._clamp(
+                    max(
+                        self.first_card_min_score,
+                        associative_trigger_score + 0.08,
+                    )
+                )
+                final_score = round(
+                    max(
+                        self._clamp(final_score + min(0.08, associative_trigger_score * 0.08)),
+                        associative_rank_floor,
+                    ),
+                    4,
+                )
             if (
                 planner_lexical_direct_match
                 or exact_match
@@ -16011,6 +16363,14 @@ class GatewayService:
                     "entity_edge_subject": str(entity_edge.get("subject") or ""),
                     "entity_edge_relation": str(entity_edge.get("relation") or ""),
                     "entity_edge_object": str(entity_edge.get("object_text") or ""),
+                    "associative_trigger_match": bool(associative_trigger_score > 0),
+                    "associative_trigger_score": associative_trigger_score,
+                    "associative_trigger_cosine": self._safe_float(associative_trigger.get("cosine"), 0.0),
+                    "associative_trigger_confidence": self._safe_float(associative_trigger.get("confidence"), 0.0),
+                    "associative_trigger_margin": self._safe_float(associative_trigger.get("margin"), 0.0),
+                    "associative_trigger_acceptance": str(associative_trigger.get("acceptance") or ""),
+                    "associative_trigger_type": str(associative_trigger.get("trigger_type") or ""),
+                    "associative_trigger_channel": str(associative_trigger.get("channel") or ""),
                     "word_map_terms": list(word_map_item_debug.get("direct_terms") or []),
                     "word_map_variant_terms": list(word_map_item_debug.get("variant_terms") or []),
                     "word_map_neighbor_terms": list(
@@ -16102,7 +16462,15 @@ class GatewayService:
             suppressed: list[dict] = []
             for raw_item in pool:
                 item = dict(raw_item)
-                if required_terms and not self._bucket_matches_any_planner_term(item.get("bucket") or {}, required_terms):
+                associative_direct = bool(
+                    item.get("associative_trigger_match")
+                    and self._associative_trigger_direct_signal(item)
+                )
+                if (
+                    required_terms
+                    and not self._bucket_matches_any_planner_term(item.get("bucket") or {}, required_terms)
+                    and not associative_direct
+                ):
                     item["admission_reason"] = "planner_must_terms_missing"
                     item["recall_policy_debug"] = {
                         "planner_must_terms": required_terms,
@@ -16153,8 +16521,12 @@ class GatewayService:
         include_query_planner_debug: bool = False,
         allow_semantic: bool = True,
         allow_query_planner: bool = True,
+        allow_associative: bool = True,
+        allow_archived_candidates: bool = False,
+        associative_query_embedding: list[float] | None = None,
         allow_semantic_session_dedupe: bool = True,
         allow_rerank: bool = True,
+        allow_expansion: bool = True,
     ) -> tuple[list[dict], list[dict]] | tuple[list[dict], list[dict], dict[str, Any]]:
         planner_debug = self._query_planner_debug_base(query)
         timing_debug = planner_debug.setdefault("timing_ms", {})
@@ -16179,12 +16551,23 @@ class GatewayService:
             all_buckets,
             search_query=search_query,
             allow_semantic=allow_semantic,
+            allow_associative=allow_associative,
+            allow_archived_candidates=allow_archived_candidates,
+            associative_query_embedding=associative_query_embedding,
             allow_semantic_session_dedupe=allow_semantic_session_dedupe,
             allow_rerank=allow_rerank,
             timing_debug=timing_debug,
             timing_prefix="direct",
         )
         structural_activation_items = list(active_pool) + list(suppressed_candidates)
+        associative_candidate_ids = {
+            str((item.get("bucket") or {}).get("id") or "")
+            for item in structural_activation_items
+            if isinstance(item, dict)
+            and item.get("associative_trigger_match")
+            and (item.get("bucket") or {}).get("id")
+        }
+        planner_debug["associative_trigger_candidate_count"] = len(associative_candidate_ids)
         self._add_timing_ms(timing_debug, "direct.candidate_items_total", stage_started_at)
         stage_started_at = time.perf_counter()
         self._merge_word_map_hint_debug(planner_debug, active_pool + suppressed_candidates)
@@ -16195,7 +16578,9 @@ class GatewayService:
         self._add_timing_ms(timing_debug, "direct.pick_cards", stage_started_at)
 
         rescue_debug = planner_debug.setdefault("semantic_rescue", {})
-        if not self.semantic_rescue_enabled:
+        if not allow_expansion:
+            rescue_debug["skip_reason"] = "implicit_evidence_only"
+        elif not self.semantic_rescue_enabled:
             rescue_debug["skip_reason"] = "disabled"
         elif len(direct_selected) >= self.inject_max_cards:
             rescue_debug["skip_reason"] = "capacity_full"
@@ -16236,7 +16621,7 @@ class GatewayService:
 
         relation_axis_queries = (
             []
-            if self._items_have_explicit_relation_pair(direct_selected)
+            if (not allow_expansion or self._items_have_explicit_relation_pair(direct_selected))
             else self._relation_axis_supplemental_queries(query)
         )
         if relation_axis_queries:
@@ -16257,6 +16642,7 @@ class GatewayService:
                         "source": "relation_axis",
                     },
                     allow_semantic=False,
+                    allow_associative=False,
                     allow_semantic_session_dedupe=allow_semantic_session_dedupe,
                     allow_rerank=False,
                     context_query=query,
@@ -16303,7 +16689,7 @@ class GatewayService:
         stage_started_at = time.perf_counter()
         trigger_reason = self._query_planner_trigger_reason(query, direct_selected)
         self._add_timing_ms(timing_debug, "query_planner_trigger_check", stage_started_at)
-        if trigger_reason and allow_query_planner:
+        if trigger_reason and allow_query_planner and allow_expansion:
             planner_debug["triggered"] = True
             planner_debug["trigger_reason"] = trigger_reason
             stage_started_at = time.perf_counter()
@@ -16335,6 +16721,7 @@ class GatewayService:
                             required_terms=must_terms,
                             planner_query=planner_query,
                             allow_semantic=allow_semantic and self.query_planner_supplemental_semantic,
+                            allow_associative=False,
                             allow_semantic_session_dedupe=allow_semantic_session_dedupe,
                             allow_rerank=allow_rerank,
                             timing_debug=timing_debug,
@@ -16507,6 +16894,15 @@ class GatewayService:
                 "retrieval_alias_sources",
                 "retrieval_alias_moment_ids",
                 "retrieval_alias_bucket_count",
+                "retrieval_alias_term_bucket_count",
+                "associative_trigger_match",
+                "associative_trigger_score",
+                "associative_trigger_cosine",
+                "associative_trigger_confidence",
+                "associative_trigger_margin",
+                "associative_trigger_acceptance",
+                "associative_trigger_type",
+                "associative_trigger_channel",
                 "semantic_rescue",
                 "semantic_rescue_direct_span",
                 "semantic_rescue_matched_axis",
@@ -16552,6 +16948,23 @@ class GatewayService:
         if not key:
             return False
         return key in {self._compact_lookup_key(value) for value in WORD_MAP_CATEGORY_SEED_TERMS}
+
+    def _retrieval_alias_anchor_direct_signal(self, query: str, item: dict) -> bool:
+        if not isinstance(item, dict) or not item.get("retrieval_alias_match"):
+            return False
+        bucket = item.get("bucket") if isinstance(item.get("bucket"), dict) else None
+        if not bucket:
+            return False
+        term_bucket_count = int(item.get("retrieval_alias_term_bucket_count") or 0)
+        if term_bucket_count <= 0 or term_bucket_count > RETRIEVAL_ALIAS_ANCHORED_MAX_TERM_BUCKETS:
+            return False
+        alias_terms = self._debug_str_list(item.get("retrieval_alias_terms"))
+        if not any(self._matched_query_term_is_specific(term) for term in alias_terms):
+            return False
+        anchor_plan = self._query_anchor_plan(query)
+        if not anchor_plan.has_direct_constraints:
+            return False
+        return self._anchor_plan_direct_rejection(bucket, anchor_plan) is None
 
     def _matched_query_terms_have_specific_evidence(self, item: dict) -> bool:
         terms = self._debug_str_list(item.get("matched_query_terms"))
@@ -16666,6 +17079,13 @@ class GatewayService:
             labels.append("category_overview_item")
         if item.get("retrieval_alias_match"):
             labels.append("retrieval_alias")
+            if self._retrieval_alias_anchor_direct_signal(query, item):
+                labels.append("retrieval_alias_anchor")
+        if (
+            item.get("associative_trigger_match")
+            and self._associative_trigger_direct_signal(item)
+        ):
+            labels.append("associative_trigger")
         if item.get("semantic_rescue_direct_span"):
             labels.append("semantic_rescue_direct_span")
         if item.get("word_map_category_seed_terms") or self._word_map_category_seed_terms(
@@ -16710,9 +17130,11 @@ class GatewayService:
             "source_record_exact",
             "taste_evidence",
             "title_anchor",
+            "retrieval_alias_anchor",
             "semantic_rescue_direct_span",
             "strong_semantic",
             "strong_rerank",
+            "associative_trigger",
         }
         return [label for label in labels or [] if label in hard]
 
@@ -16946,6 +17368,7 @@ class GatewayService:
             or item.get("category_overview_item")
             or item.get("explicit_relation_edge_match")
             or item.get("entity_edge_match")
+            or item.get("associative_trigger_match")
         ):
             evidence_tier = 0
         elif self.recall_policy.has_strong_score(
@@ -16959,12 +17382,15 @@ class GatewayService:
             evidence_tier = 3
         else:
             evidence_tier = 4
-        bucket_id = str((item.get("bucket") or {}).get("id") or "")
+        bucket = item.get("bucket") or {}
+        bucket_id = str(bucket.get("id") or "")
         recent_penalty = bool(recent_ids and bucket_id in recent_ids and evidence_tier != 0)
+        source_evidence_penalty = 1 if self._is_source_record_bucket(bucket) else 0
         if self.recall_fusion_mode == "dynamic":
             return (
                 recent_penalty,
                 evidence_tier,
+                source_evidence_penalty,
                 -self._safe_float(item.get("score"), 0.0),
                 self._bucket_recall_rank(query, item.get("bucket") or {}, item.get("score", 0.0))[0],
                 -self._safe_float(item.get("rerank_score"), 0.0),
@@ -16973,6 +17399,7 @@ class GatewayService:
         return (
             recent_penalty,
             evidence_tier,
+            source_evidence_penalty,
             self._bucket_recall_rank(query, item.get("bucket") or {}, item.get("score", 0.0))[0],
             -self._safe_float(item.get("rerank_score"), 0.0),
             -self._safe_float(item.get("semantic_score"), 0.0),
@@ -17111,6 +17538,8 @@ class GatewayService:
                 list(group) for group in (getattr(query_plan, "activated_axis_groups", ()) or ())
             ],
             "activated_axis_multi": bool(getattr(query_plan, "activated_axis_multi", False)),
+            "excluded_axis_terms": list(getattr(query_plan, "excluded_axis_terms", ()) or ()),
+            "axis_polarity": dict(getattr(query_plan, "axis_polarity_debug", {}) or {}),
             "activated_axis_matched": bool(matched),
             "activated_axis_technical": self._axis_lite_has_technical_axis(query_plan),
             "auto": True,
@@ -17126,6 +17555,10 @@ class GatewayService:
             or item.get("distinctive_anchor_match")
             or item.get("category_overview_item")
             or item.get("semantic_rescue_direct_span")
+            or (
+                item.get("associative_trigger_match")
+                and self._associative_trigger_direct_signal(item)
+            )
         ):
             return True
         if self._entity_edge_direct_signal(item):
@@ -17285,9 +17718,12 @@ class GatewayService:
             or self._entity_edge_direct_signal(item)
             or self._is_identity_name_candidate_bucket(query, bucket)
             or "title_anchor" in hard_evidence_labels
+            or "retrieval_alias_anchor" in hard_evidence_labels
             or "semantic_rescue_direct_span" in hard_evidence_labels
+            or "associative_trigger" in hard_evidence_labels
             or "strong_semantic" in hard_evidence_labels
             or "strong_rerank" in hard_evidence_labels
+            or "associative_trigger" in hard_evidence_labels
         )
         dynamic_anchor_missing = bool(
             dynamic_plan.get("required_terms")
@@ -17298,15 +17734,31 @@ class GatewayService:
             dynamic_plan.get("category_overview")
             and dynamic_plan.get("category_terms")
             and not item.get("category_overview_item")
+            and not independent_anchor_evidence
         )
         query_plan = self._recall_query_plan(query)
+        if not self._bucket_matches_explicit_entity_anchor(query, bucket, signal=item):
+            item["admission_reason"] = "explicit_entity_anchor_missing"
+            item["blocked_reason"] = "explicit_entity_anchor_missing"
+            item["recall_policy_debug"] = {
+                **(item.get("recall_policy_debug") if isinstance(item.get("recall_policy_debug"), dict) else {}),
+                "required_entity_anchor_terms": list(getattr(query_plan, "entity_anchor_terms", ()) or ()),
+                "auto": True,
+            }
+            return False
         rejection = self._anchor_plan_direct_rejection(bucket, self._query_anchor_plan(query))
         if rejection:
             reason, debug = rejection
-            if reason == "anchor_must_group_missing" and self._can_bypass_anchor_with_strong_model_score(
-                query,
-                semantic_score=item.get("semantic_score"),
-                rerank_score=item.get("rerank_score"),
+            if reason == "anchor_must_group_missing" and (
+                self._can_bypass_anchor_with_strong_model_score(
+                    query,
+                    semantic_score=item.get("semantic_score"),
+                    rerank_score=item.get("rerank_score"),
+                )
+                or (
+                    item.get("associative_trigger_match")
+                    and self._associative_trigger_direct_signal(item)
+                )
             ):
                 item["recall_policy_debug"] = {
                     **debug,
@@ -17337,6 +17789,8 @@ class GatewayService:
                 or self._word_map_direct_signal(item)
                 or self._entity_edge_direct_signal(item)
                 or item.get("semantic_rescue_direct_span")
+                or "associative_trigger" in hard_evidence_labels
+                or "retrieval_alias_anchor" in hard_evidence_labels
                 or "title_anchor" in hard_evidence_labels
             ),
             auto=True,
@@ -17406,6 +17860,11 @@ class GatewayService:
             or item.get("distinctive_anchor_match")
             or item.get("category_overview_item")
             or item.get("semantic_rescue_direct_span")
+            or self._retrieval_alias_anchor_direct_signal(query, item)
+            or (
+                item.get("associative_trigger_match")
+                and self._associative_trigger_direct_signal(item)
+            )
         ):
             return True
         if self._entity_edge_direct_signal(item):
@@ -17640,6 +18099,174 @@ class GatewayService:
                     scored.append((bucket["id"], keyword_score))
         scored.sort(key=lambda item: item[1], reverse=True)
         return {bucket_id: score for bucket_id, score in scored[: self.dynamic_top_k]}
+
+    async def _warm_associative_query_embedding(self) -> bool:
+        if (
+            not self.associative_trigger_enabled
+            or not getattr(self.embedding_engine, "enabled", False)
+        ):
+            return False
+        try:
+            if not self.memory_moment_store.has_associative_triggers():
+                return False
+        except Exception as exc:
+            logger.warning("Gateway associative trigger startup warm availability check failed: %s", exc)
+            return False
+        try:
+            embedding = await asyncio.wait_for(
+                self.embedding_engine.embed_text("记忆联想检索预热", kind="query"),
+                timeout=self.associative_trigger_startup_warm_timeout_seconds,
+            )
+            return bool(embedding)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Gateway associative trigger startup warm timed out | timeout_seconds=%.2f",
+                self.associative_trigger_startup_warm_timeout_seconds,
+            )
+            return False
+        except Exception as exc:
+            logger.warning("Gateway associative trigger startup warm failed: %s", exc)
+            return False
+
+    async def _get_associative_query_embedding(self, query: str) -> list[float]:
+        if (
+            not self.associative_trigger_enabled
+            or not query
+            or not getattr(self.embedding_engine, "enabled", False)
+        ):
+            return []
+        try:
+            if not self.memory_moment_store.has_associative_triggers():
+                return []
+        except Exception as exc:
+            logger.warning("Gateway associative trigger availability check failed: %s", exc)
+            return []
+        try:
+            embedding_call = self.embedding_engine.embed_text(query, kind="query")
+            if self.embedding_query_timeout_seconds > 0:
+                return list(
+                    await asyncio.wait_for(
+                        embedding_call,
+                        timeout=self.embedding_query_timeout_seconds,
+                    )
+                    or []
+                )
+            return list(await embedding_call or [])
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Gateway associative trigger embedding timed out | query_chars=%s timeout_seconds=%.2f",
+                len(str(query or "")),
+                self.embedding_query_timeout_seconds,
+            )
+            return []
+        except Exception as exc:
+            logger.warning("Gateway associative trigger embedding failed: %s", exc)
+            return []
+
+    def _associative_trigger_direct_signal(self, item: dict[str, Any] | None) -> bool:
+        if not isinstance(item, dict):
+            return False
+        cosine = self._safe_float(item.get("associative_trigger_cosine", item.get("cosine")), 0.0)
+        confidence = self._safe_float(item.get("associative_trigger_confidence", item.get("confidence")), 0.0)
+        margin = self._safe_float(item.get("associative_trigger_margin", item.get("margin")), 0.0)
+        effective_score = self._safe_float(
+            item.get("associative_trigger_score", item.get("effective_score")),
+            cosine * (0.75 + 0.25 * confidence),
+        )
+        if confidence < 0.62:
+            return False
+        if cosine >= self.associative_trigger_strong_gate:
+            return True
+        return bool(
+            cosine >= self.associative_trigger_soft_gate
+            and effective_score >= self.associative_trigger_soft_effective_gate
+            and confidence >= self.associative_trigger_soft_confidence
+            and margin >= self.associative_trigger_margin
+        )
+
+    async def _get_associative_trigger_candidates(
+        self,
+        query: str,
+        eligible_ids: set[str],
+        *,
+        query_embedding: list[float] | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        if (
+            not self.associative_trigger_enabled
+            or not query
+            or not eligible_ids
+            or not getattr(self.embedding_engine, "enabled", False)
+        ):
+            return {}
+        if query_embedding is None:
+            query_embedding = await self._get_associative_query_embedding(query)
+        if not query_embedding:
+            return {}
+        competition_floor = max(
+            0.0,
+            self.associative_trigger_soft_gate - max(0.12, self.associative_trigger_margin + 0.04),
+        )
+        try:
+            rows = self.memory_moment_store.search_associative_triggers(
+                query_embedding,
+                eligible_bucket_ids=eligible_ids,
+                embedding_model=str(getattr(self.embedding_engine, "model", "") or ""),
+                top_k=min(120, max(24, self.associative_trigger_top_k * 4)),
+                min_cosine=competition_floor,
+            )
+        except Exception as exc:
+            logger.warning("Gateway associative trigger search failed: %s", exc)
+            return {}
+        best_by_bucket: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            bucket_id = str(row.get("bucket_id") or "").strip()
+            if not bucket_id or bucket_id not in eligible_ids:
+                continue
+            cosine = self._clamp(self._safe_float(row.get("score"), 0.0))
+            confidence = self._clamp(self._safe_float(row.get("confidence"), 0.0))
+            effective_score = self._clamp(cosine * (0.75 + 0.25 * confidence))
+            current = best_by_bucket.get(bucket_id)
+            if current:
+                current_cosine = self._safe_float(current.get("cosine"), 0.0)
+                current_confidence = self._safe_float(current.get("confidence"), 0.0)
+                if current_cosine > cosine or (
+                    abs(current_cosine - cosine) <= 1e-9 and current_confidence >= confidence
+                ):
+                    continue
+            best_by_bucket[bucket_id] = {
+                "effective_score": effective_score,
+                "cosine": cosine,
+                "confidence": confidence,
+                "trigger_type": str(row.get("trigger_type") or ""),
+                "channel": str(row.get("channel") or ""),
+            }
+        accepted: list[tuple[str, dict[str, Any]]] = []
+        for bucket_id, payload in best_by_bucket.items():
+            competing = max(
+                (
+                    self._safe_float(other.get("cosine"), 0.0)
+                    for other_id, other in best_by_bucket.items()
+                    if other_id != bucket_id
+                ),
+                default=0.0,
+            )
+            payload["margin"] = max(0.0, self._safe_float(payload.get("cosine"), 0.0) - competing)
+            if not self._associative_trigger_direct_signal(payload):
+                continue
+            payload["acceptance"] = (
+                "strong"
+                if self._safe_float(payload.get("cosine"), 0.0) >= self.associative_trigger_strong_gate
+                else "soft_margin"
+            )
+            accepted.append((bucket_id, payload))
+        accepted.sort(
+            key=lambda pair: (
+                -self._safe_float(pair[1].get("effective_score"), 0.0),
+                -self._safe_float(pair[1].get("cosine"), 0.0),
+                pair[0],
+            )
+        )
+        return dict(accepted[: self.associative_trigger_top_k])
 
     async def _get_semantic_candidates(self, query: str, eligible_ids: set[str]) -> dict[str, float]:
         if not getattr(self.embedding_engine, "enabled", False):
@@ -18028,6 +18655,10 @@ class GatewayService:
             or self._word_map_direct_signal(item)
             or item.get("distinctive_anchor_match")
             or item.get("category_overview_item")
+            or (
+                item.get("associative_trigger_match")
+                and self._associative_trigger_direct_signal(item)
+            )
         ):
             return True
         if self._is_high_confidence_match(
@@ -18810,6 +19441,7 @@ class GatewayService:
             "retrieval_alias_sources": list(item.get("retrieval_alias_sources") or []),
             "retrieval_alias_moment_ids": list(item.get("retrieval_alias_moment_ids") or []),
             "retrieval_alias_bucket_count": int(item.get("retrieval_alias_bucket_count") or 0),
+            "retrieval_alias_term_bucket_count": int(item.get("retrieval_alias_term_bucket_count") or 0),
             "semantic_rescue": (
                 dict(item.get("semantic_rescue"))
                 if isinstance(item.get("semantic_rescue"), dict)
@@ -19507,11 +20139,15 @@ class GatewayService:
         allow_rerank: bool,
         admission_mode: str = "light",
         require_direct_topic: bool = False,
+        include_archive: bool = False,
     ) -> tuple[list[dict[str, Any]], list[str], dict[str, Any]]:
         memory_sentinel_debug = self._memory_sentinel_debug_base(query)
         memory_sentinel_debug["searchable_residue_terms"] = self._memory_sentinel_searchable_residue_terms(query)
         query_planner_debug = self._query_planner_debug_base(query)
-        domain_sentinel_debug = await self._route_domain_sentinel(query)
+        domain_sentinel_debug, associative_query_embedding = await asyncio.gather(
+            self._route_domain_sentinel(query),
+            self._get_associative_query_embedding(query),
+        )
         if max_cards <= 0:
             return [], [], {
                 "query_preview": self._clip_text(query, 500),
@@ -19546,9 +20182,10 @@ class GatewayService:
                 },
             }
 
-        all_buckets = await self._list_gateway_buckets(include_archive=False)
+        all_buckets = await self._list_gateway_buckets(include_archive=include_archive)
         domain_query = str(domain_sentinel_debug.get("query") or "").strip()
-        if self._domain_sentinel_should_skip_recall(domain_sentinel_debug, query):
+        domain_recall_mode = self._domain_sentinel_recall_mode(domain_sentinel_debug, query)
+        if domain_recall_mode == "hard_skip":
             domain_sentinel_debug["skip_applied"] = True
             query_planner_debug["skip_reason"] = "domain_sentinel_skip"
             return [], [], {
@@ -19571,6 +20208,9 @@ class GatewayService:
                     "candidate_count": 0,
                 },
             }
+        implicit_evidence_only = domain_recall_mode == "implicit"
+        if implicit_evidence_only:
+            domain_sentinel_debug["implicit_evidence_only"] = True
         search_query = self._dynamic_recall_search_query(domain_query or query, memory_sentinel_debug)
         selected_buckets, suppressed_buckets, query_planner_debug = await self._select_dynamic_buckets(
             query,
@@ -19578,10 +20218,12 @@ class GatewayService:
             all_buckets,
             search_query=search_query,
             include_query_planner_debug=True,
-            allow_semantic=allow_semantic,
-            allow_query_planner=allow_query_planner,
+            allow_semantic=allow_semantic and not implicit_evidence_only,
+            allow_query_planner=allow_query_planner and not implicit_evidence_only,
+            associative_query_embedding=associative_query_embedding,
             allow_semantic_session_dedupe=allow_semantic_session_dedupe,
             allow_rerank=allow_rerank,
+            allow_expansion=not implicit_evidence_only,
         )
         selected_buckets = self._with_explicit_source_record_buckets(
             query,
@@ -19634,6 +20276,19 @@ class GatewayService:
             recalled_ids.append(bucket_id)
             cards.append(card)
 
+        associative_selected = [
+            bucket
+            for bucket in selected_buckets
+            if isinstance(bucket.get("_recall_signal"), dict)
+            and bucket["_recall_signal"].get("associative_trigger_match")
+        ]
+        associative_top_score = max(
+            (
+                self._safe_float((bucket.get("_recall_signal") or {}).get("associative_trigger_score"), 0.0)
+                for bucket in associative_selected
+            ),
+            default=0.0,
+        )
         debug_payload = {
             "query_preview": self._clip_text(query, 500),
             "domain_sentinel_debug": domain_sentinel_debug,
@@ -19657,8 +20312,10 @@ class GatewayService:
                 "mode": "fast_bucket",
                 "search_query": search_query,
                 "domain_query": domain_query,
-                "allow_semantic": allow_semantic,
-                "allow_query_planner": allow_query_planner,
+                "allow_semantic": allow_semantic and not implicit_evidence_only,
+                "allow_query_planner": allow_query_planner and not implicit_evidence_only,
+                "domain_recall_mode": domain_recall_mode,
+                "implicit_evidence_only": implicit_evidence_only,
                 "allow_semantic_session_dedupe": allow_semantic_session_dedupe,
                 "allow_rerank": allow_rerank,
                 "include_diffused_requested": include_diffused,
@@ -19667,9 +20324,54 @@ class GatewayService:
                 "light_suppressed_bucket_ids": topic_suppressed_bucket_ids if admission_mode == "light" else [],
                 "focused_full_suppressed_bucket_ids": topic_suppressed_bucket_ids if admission_mode == "full" else [],
                 "candidate_count": len(selected_buckets or []) + len(suppressed_buckets or []) + len(topic_suppressed_bucket_ids),
+                "associative_candidate_count": int(query_planner_debug.get("associative_trigger_candidate_count") or 0),
+                "associative_selected_count": len(associative_selected),
+                "associative_direct_signal_count": sum(
+                    1
+                    for bucket in associative_selected
+                    if self._associative_trigger_direct_signal(bucket.get("_recall_signal") or {})
+                ),
+                "associative_top_score": round(associative_top_score, 4),
             },
         }
         return cards, recalled_ids, debug_payload
+
+    def _explicit_entity_anchor_keys(self, query: str) -> list[str]:
+        recall_policy = getattr(self, "recall_policy", None)
+        if recall_policy is None or not callable(getattr(recall_policy, "plan_query", None)):
+            return []
+        query_plan = self._recall_query_plan(query)
+        if not bool(getattr(query_plan, "explicit_old_memory", False)):
+            return []
+        return list(dict.fromkeys(
+            self._compact_lookup_key(term)
+            for term in (getattr(query_plan, "entity_anchor_terms", ()) or ())
+            if self._compact_lookup_key(term)
+        ))
+
+    def _bucket_matches_explicit_entity_anchor(
+        self,
+        query: str,
+        bucket: dict[str, Any],
+        *,
+        signal: dict[str, Any] | None = None,
+    ) -> bool:
+        required_keys = self._explicit_entity_anchor_keys(query)
+        if not required_keys:
+            return True
+        metadata = bucket.get("metadata") if isinstance(bucket.get("metadata"), dict) else {}
+        signal = signal if isinstance(signal, dict) else {}
+        direct_text = " ".join(
+            [
+                str(metadata.get("name") or bucket.get("name") or ""),
+                bucket_content_for_recall(bucket),
+                " ".join(self._debug_str_list(signal.get("retrieval_alias_terms"))),
+                " ".join(self._debug_str_list(signal.get("exact_anchor_terms"))),
+                " ".join(self._debug_str_list(signal.get("matched_query_terms"))),
+            ]
+        )
+        direct_key = self._compact_lookup_key(direct_text)
+        return any(key and key in direct_key for key in required_keys)
 
     def _hook_bucket_has_strong_topic_evidence(
         self,
@@ -19685,6 +20387,16 @@ class GatewayService:
             return True
 
         signal = bucket.get("_recall_signal") if isinstance(bucket.get("_recall_signal"), dict) else {}
+        if not self._bucket_matches_explicit_entity_anchor(query, bucket, signal=signal):
+            return False
+        if (
+            allow_signal
+            and signal.get("associative_trigger_match")
+            and self._associative_trigger_direct_signal(signal)
+        ):
+            return True
+        if allow_signal and "retrieval_alias_anchor" in self._debug_str_list(signal.get("hard_evidence_labels")):
+            return True
         query_terms = [
             term
             for term in self.recall_policy.specific_query_terms(query)
@@ -19721,8 +20433,8 @@ class GatewayService:
         residue = self._hook_light_query_residue(query)
         return bool(len(residue) >= 4 and residue in bucket_key)
 
-    def _hook_focused_bucket_rank(self, query: str, bucket: dict[str, Any]) -> tuple[int, int, int, int]:
-        """Prefer direct, concentrated evidence over broad multi-topic source documents."""
+    def _hook_focused_bucket_rank(self, query: str, bucket: dict[str, Any]) -> tuple[int, int, int, int, int]:
+        """Prefer canonical memory first, then concentrated source evidence fragments."""
         metadata = bucket.get("metadata") if isinstance(bucket.get("metadata"), dict) else {}
         title_key = self._compact_lookup_key(
             str(metadata.get("name") or bucket.get("name") or "")
@@ -19744,7 +20456,8 @@ class GatewayService:
                 for cue in ("用来", "用于", "专门", "记录", "写", "用途", "作用")
                 if cue in str(content or "")
             )
-        return (longest, len(set(direct_matches)), purpose_cues + title_hits, -len(content_key))
+        canonical_tier = 0 if self._is_source_record_bucket(bucket) else 1
+        return (canonical_tier, longest, len(set(direct_matches)), purpose_cues + title_hits, -len(content_key))
 
     def _hook_light_query_residue(self, query: str) -> str:
         text = strip_human_date_references(str(query or ""))
@@ -19772,6 +20485,50 @@ class GatewayService:
             return None
         metadata = bucket.get("metadata") if isinstance(bucket.get("metadata"), dict) else {}
         title = str(metadata.get("name") or bucket.get("name") or bucket_id).strip()
+        if self._is_source_record_bucket(bucket):
+            synthetic = self._source_record_synthetic_moment_for_bucket(
+                bucket,
+                query,
+                selected_reason="hook_direct_bucket",
+            )
+            if not synthetic:
+                return None
+            synthetic_meta = synthetic.get("metadata") if isinstance(synthetic.get("metadata"), dict) else {}
+            text = str(synthetic.get("text") or "").strip()
+            if not text:
+                return None
+            note = {
+                "use": "evidence_only",
+                "why": "Gateway selected a query-matched fragment from a source evidence container.",
+                "reliability": "source_record",
+                "usage_mode": "silent",
+                "mention_policy": "never_mention_unless_user_asks",
+                "conflict_rule": "current_user_message_wins",
+                "canonical_domain": "",
+                "kind": "source_record",
+                "status_view": "",
+                "stability_class": "historical_evidence",
+                "validity_state": "evidence",
+                "flags": ["source_record_fragment_only"],
+            }
+            row = {
+                "bucket_id": bucket_id,
+                "bucket_name": title,
+                "content_preview": self._clip_text(text, max_chars),
+                "score": bucket.get("score") or 1.0,
+                "reading_note": note,
+                "source_record_fragment_seed": bool(synthetic_meta.get("source_record_fragment_seed")),
+            }
+            return self._hook_recall_card(
+                source="source_record",
+                bucket_id=bucket_id,
+                moment_id=str(synthetic.get("moment_id") or ""),
+                title=title,
+                text=text,
+                render_shape=str(synthetic.get("section") or "source_fragment"),
+                row=row,
+                max_chars=max_chars,
+            )
         text = bucket_content_for_recall(bucket)
         if title and self._compact_lookup_key(title) not in self._compact_lookup_key(text):
             text = f"{title}\n{text}".strip()
@@ -19782,6 +20539,10 @@ class GatewayService:
         reliable = bool(
             self._planner_lexical_direct_signal(signal)
             or signal.get("exact_anchor_match")
+            or (
+                signal.get("associative_trigger_match")
+                and self._associative_trigger_direct_signal(signal)
+            )
             or self._is_high_confidence_match(
                 self._safe_float(signal.get("semantic_score"), 0.0),
                 self._safe_float(signal.get("keyword_score"), 0.0),
@@ -19808,7 +20569,7 @@ class GatewayService:
             "bucket_id": bucket_id,
             "bucket_name": title,
             "content_preview": self._clip_text(text, max_chars),
-            "score": bucket.get("score") or signal.get("semantic_score") or signal.get("keyword_score") or 0.0,
+            "score": bucket.get("score") or signal.get("score") or signal.get("associative_trigger_score") or signal.get("semantic_score") or signal.get("keyword_score") or 0.0,
             "reading_note": note,
         }
         return self._hook_recall_card(

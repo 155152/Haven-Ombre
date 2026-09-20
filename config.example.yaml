@@ -362,6 +362,14 @@ gateway:
   cooldown_floor: 0.3
   semantic_session_dedupe_enabled: true
   semantic_session_dedupe_threshold: 0.90
+  associative_trigger_enabled: true    # T-Mem-style bridge/horizon trigger candidates; triggers never enter prompt evidence
+  associative_trigger_top_k: 8          # max accepted bucket hits considered before normal admission/rerank
+  associative_trigger_strong_gate: 0.72 # high-similarity trigger can pass without a competitor-margin check
+  associative_trigger_soft_gate: 0.48   # absolute semantic floor for the calibrated soft band
+  associative_trigger_soft_effective_gate: 0.50  # cosine adjusted by trigger confidence must also clear this gate
+  associative_trigger_margin: 0.08      # soft-band hit must beat the best competing bucket by at least this cosine margin
+  associative_trigger_soft_confidence: 0.72
+  associative_trigger_startup_warm_timeout_seconds: 12  # startup-only query-embedding warm; normal recall keeps its tighter timeout
   semantic_session_dedupe_lexical_threshold: 0.82
   inject_total_budget: 1800
   core_memory_budget: 0
@@ -684,6 +692,10 @@ reflection:
   candidate_recent_limit: 8
   candidate_semantic_limit: 6
   edge_min_confidence: 0.55
+  associative_triggers_enabled: true      # generate retrieval-only bridge/horizon triggers after canonical bucket writes
+  associative_trigger_min_confidence: 0.62 # low-confidence generated triggers are discarded before indexing
+  associative_trigger_max_per_bucket: 4   # at most 2 bridge + 2 useful horizon triggers in the default prompt
+  associative_trigger_backfill_limit: 10  # bounded manual /api/associative-triggers/backfill batch size
   identity_role_edges:
     enabled: false                 # optional, deployment-specific role/title edge hints
     detail: {}                     # e.g. concrete role combinations or private aliases

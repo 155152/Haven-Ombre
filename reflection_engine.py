@@ -73,6 +73,36 @@ DAILY_CHAT_MEMORY_WORD_MAP_BLOCK_TERMS = {
 }
 
 
+ASSOCIATIVE_TRIGGER_PROMPT = """你是 Ombre 的联想召回索引器。输入是一条已经正式写入的长期记忆。
+你的输出不是记忆正文，不会交给聊天模型作为事实证据；它只用于未来检索这条记忆。
+
+请生成两类 trigger：
+1. bridge_triggers：最多两条，优先覆盖互补的两种重新相关方式：
+   - 类似场景桥：未来再次遇到相似情境、决策点或问题时，这条记忆会突然变得相关。
+   - 回顾重提桥：未来用户用自然口语重新提到这段经历、同一地点/人物/处境，或再次说出当时的结果与反差时，即使没有明确说“你还记得吗”，也应该想到这条记忆。
+   不要只改写原文或换同义词；要保留足够具体的场景锚点，使不同措辞仍可找到原记忆。
+2. horizon_triggers：这条记忆未来可能沿什么连续性轨迹重新变得相关。channel 只能是 personal_arc / avoidance_habit / goal_arc / belief_in_action / legacy_anchor。
+
+硬规则：
+- 只能根据输入记忆本身推导，不得编造新事实。
+- trigger 必须自包含，8~80 个中文字符；最多 2 条 bridge + 2 条 horizon。若记忆包含明确的人物/地点/处境，回顾重提桥应尽量保留该具体锚点，而不是抽象成泛化主题。
+- 如果没有可靠的 horizon 信号，可以少写或不写；不要为了凑数强填。
+- confidence 表示“未来只看到这个 trigger 时，是否可靠地应该把这条记忆召回”，范围 0~1；低于 0.55 的不要输出。
+- 避免“关系、生活、情绪、项目、记忆”这类过泛词。
+- trigger 只能帮助找到原记忆，不能代替原记忆，也不要写 bucket id、数据库、召回机制等内部信息。
+
+只输出 JSON：
+{
+  "bridge_triggers": [
+    {"text": "未来具体情境", "confidence": 0.78}
+  ],
+  "horizon_triggers": [
+    {"channel": "goal_arc", "text": "未来连续性轨迹", "confidence": 0.72}
+  ]
+}
+"""
+
+
 CLASSIFY_PROMPT = """你是 Ombre-Brain 的记忆关系整理器。
 输入是一条新记忆和若干旧记忆候选。请只根据文本中能看见的内容，给新记忆补轻量分类和关系边。
 
@@ -397,6 +427,15 @@ class ReflectionEngine:
         self.weekly_hour = int(cfg.get("weekly_hour", self.daily_hour))
         self.check_interval_minutes = max(5, int(cfg.get("check_interval_minutes", 60)))
         self.edge_min_confidence = float(cfg.get("edge_min_confidence", 0.55))
+        self.associative_triggers_enabled = bool(cfg.get("associative_triggers_enabled", True))
+        self.associative_trigger_min_confidence = max(
+            0.55,
+            min(0.95, float(cfg.get("associative_trigger_min_confidence", 0.62))),
+        )
+        self.associative_trigger_max_per_bucket = max(
+            1,
+            min(6, int(cfg.get("associative_trigger_max_per_bucket", 4))),
+        )
         self.diary_mcp_url = str(cfg.get("diary_mcp_url") or "").strip()
         self.diary_mcp_token_env = str(cfg.get("diary_mcp_token_env") or "").strip()
         self.diary_memory_extract_enabled = bool(cfg.get("diary_memory_extract_enabled", True))
@@ -619,6 +658,7 @@ class ReflectionEngine:
         bucket_mgr,
         edge_store: MemoryEdgeStore,
         embedding_engine=None,
+        memory_moment_store=None,
         force: bool = False,
     ) -> dict:
         if not self.enabled or (not self.enrich_on_write and not force):
@@ -673,12 +713,20 @@ class ReflectionEngine:
 
         edges = self._edges_from_classification(bucket, candidates, result, confidence)
         saved_edges = edge_store.add_edges(edges[:3])
+        trigger_result = await self._refresh_associative_triggers(
+            bucket,
+            memory_moment_store=memory_moment_store,
+            embedding_engine=embedding_engine,
+            force=force,
+        )
         return {
             "status": "ok",
             "id": bucket_id,
             "tags": tags,
             "confidence": confidence,
             "edges": len(saved_edges),
+            "associative_triggers": int(trigger_result.get("written") or 0),
+            "associative_trigger_status": str(trigger_result.get("status") or "skipped"),
         }
 
     async def backfill_edges_for_bucket(
@@ -1134,6 +1182,144 @@ class ReflectionEngine:
                 if add_candidate(item):
                     return candidates
         return candidates
+
+    async def _refresh_associative_triggers(
+        self,
+        bucket: dict,
+        *,
+        memory_moment_store=None,
+        embedding_engine=None,
+        force: bool = False,
+    ) -> dict:
+        if not self.associative_triggers_enabled:
+            return {"status": "disabled", "written": 0}
+        if memory_moment_store is None:
+            return {"status": "missing_store", "written": 0}
+        if not self.client or not self.model:
+            return {"status": "missing_llm", "written": 0}
+        if not embedding_engine or not getattr(embedding_engine, "enabled", False):
+            return {"status": "missing_embedding", "written": 0}
+        bucket_id = str(bucket.get("id") or "").strip()
+        if not bucket_id:
+            return {"status": "missing_bucket_id", "written": 0}
+        source_hash = str(memory_moment_store.associative_source_hash(bucket) or "").strip()
+        if not source_hash:
+            return {"status": "missing_source_hash", "written": 0}
+        existing = memory_moment_store.list_associative_triggers(bucket_id)
+        state = memory_moment_store.get_associative_trigger_state(bucket_id)
+        current_embedding_model = str(getattr(embedding_engine, "model", "") or "").strip()
+        state_is_current = bool(
+            state
+            and str(state.get("source_hash") or "") == source_hash
+            and str(state.get("embedding_model") or "").strip() == current_embedding_model
+        )
+        if not force and state_is_current:
+            state_status = str(state.get("status") or "").strip().lower()
+            if state_status == "empty":
+                return {"status": "current_empty", "written": 0}
+            if state_status == "ready" and existing:
+                return {"status": "current", "written": len(existing)}
+        # Mark the index pending before generation. This clears stale vectors and
+        # makes transient LLM/embedding failures retryable without serving old cues.
+        memory_moment_store.replace_associative_triggers(
+            bucket_id,
+            source_hash,
+            [],
+            embedding_model=current_embedding_model,
+            status="pending",
+        )
+
+        payload = self._memory_payload(bucket, content_limit=1800)
+        try:
+            response = await self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": ASSOCIATIVE_TRIGGER_PROMPT},
+                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                ],
+                **self._completion_options(max_tokens=min(700, self.max_tokens), temperature=0.0),
+            )
+            raw = response.choices[0].message.content if response.choices else ""
+            parsed = self._parse_json_object(raw or "") or {}
+        except Exception as exc:
+            logger.warning("Associative trigger generation failed for %s: %s", bucket_id, exc)
+            return {"status": "generation_failed", "written": 0}
+
+        normalized: list[dict] = []
+        allowed_channels = {
+            "personal_arc",
+            "avoidance_habit",
+            "goal_arc",
+            "belief_in_action",
+            "legacy_anchor",
+        }
+
+        def add_trigger(raw_item: Any, trigger_type: str, channel: str = "") -> None:
+            if len(normalized) >= self.associative_trigger_max_per_bucket or not isinstance(raw_item, dict):
+                return
+            trigger_text = re.sub(r"\s+", " ", str(raw_item.get("text") or "").strip())
+            try:
+                confidence = self._clamp(raw_item.get("confidence", 0.0))
+            except Exception:
+                confidence = 0.0
+            if confidence < self.associative_trigger_min_confidence:
+                return
+            if len(trigger_text) < 4 or len(trigger_text) > 240:
+                return
+            normalized.append(
+                {
+                    "trigger_type": trigger_type,
+                    "channel": channel,
+                    "trigger_text": trigger_text,
+                    "confidence": confidence,
+                }
+            )
+
+        for item in list(parsed.get("bridge_triggers") or [])[:2]:
+            add_trigger(item, "bridge")
+        for item in list(parsed.get("horizon_triggers") or [])[:2]:
+            if not isinstance(item, dict):
+                continue
+            channel = str(item.get("channel") or "").strip().lower()
+            if channel not in allowed_channels:
+                continue
+            add_trigger(item, "horizon", channel)
+        if not normalized:
+            memory_moment_store.replace_associative_triggers(
+                bucket_id,
+                source_hash,
+                [],
+                embedding_model=current_embedding_model,
+                status="empty",
+            )
+            return {"status": "empty", "written": 0}
+
+        embedded: list[dict] = []
+        for item in normalized:
+            try:
+                vector = await embedding_engine.embed_text(item["trigger_text"], kind="document")
+            except Exception as exc:
+                logger.warning("Associative trigger embedding failed for %s: %s", bucket_id, exc)
+                vector = []
+            if not vector:
+                continue
+            embedded.append(
+                {
+                    **item,
+                    "embedding": vector,
+                    "embedding_model": str(getattr(embedding_engine, "model", "") or ""),
+                }
+            )
+        if not embedded:
+            return {"status": "embedding_failed", "written": 0}
+        written = memory_moment_store.replace_associative_triggers(
+            bucket_id,
+            source_hash,
+            embedded,
+            embedding_model=current_embedding_model,
+            status="ready",
+        )
+        return {"status": "ok" if written else "embedding_failed", "written": written}
 
     async def _api_classify(self, bucket: dict, candidates: list[dict]) -> dict:
         payload = {
@@ -3745,6 +3931,12 @@ class ReflectionEngine:
                     try:
                         memory_moment_store.upsert_bucket(existing_bucket)
                         moment_indexed += 1
+                        await self._refresh_associative_triggers(
+                            existing_bucket,
+                            memory_moment_store=memory_moment_store,
+                            embedding_engine=embedding_engine,
+                            force=False,
+                        )
                     except Exception as exc:
                         index_errors.append(f"moment:{type(exc).__name__}")
                         logger.warning("Daily chat memory moment indexing failed for %s: %s", bucket_id, exc)
@@ -3803,6 +3995,12 @@ class ReflectionEngine:
                     try:
                         memory_moment_store.upsert_bucket(bucket)
                         moment_indexed += 1
+                        await self._refresh_associative_triggers(
+                            bucket,
+                            memory_moment_store=memory_moment_store,
+                            embedding_engine=embedding_engine,
+                            force=False,
+                        )
                     except Exception as exc:
                         index_errors.append(f"moment:{type(exc).__name__}")
                         logger.warning("Daily chat memory moment indexing failed for %s: %s", new_id, exc)

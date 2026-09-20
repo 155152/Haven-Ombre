@@ -623,6 +623,10 @@ AFFECTION_ONLY_FILLER_TERMS = frozenset(
         "姐姐",
         "我",
         "你",
+        "可以",
+        "可不可以",
+        "能不能",
+        "能",
         "还",
         "也",
         "很",
@@ -713,6 +717,26 @@ LOCATABLE_GENERIC_TERMS = frozenset(
 )
 EVENT_PLACE_LOCATABLE_TERMS = frozenset({"水边", "海边", "岸边"})
 EVENT_PLACE_QUERY_MARKERS = frozenset({"那次", "这次", "那天", "当天", "当时", "那回", "这一回", "那件事", "这件事"})
+AXIS_NEGATION_MARKERS = (
+    "不是因为",
+    "并不是因为",
+    "倒不是因为",
+    "不在于",
+    "并不是",
+    "倒不是",
+    "不是",
+    "并非",
+    "不算",
+    "没有",
+    "不用",
+    "无需",
+    "不需要",
+    "不必",
+    "无关",
+)
+AXIS_CONTRAST_MARKERS = ("但是", "不过", "可是", "然而", "而是", "反而", "但", "却")
+AXIS_NEGATION_LOOKBEHIND = 8
+AXIS_NEGATION_LOOKAHEAD = 10
 LOCATABLE_STRIP_TERMS = frozenset(
     {
         *AUTO_VAGUE_FILLER_TERMS,
@@ -984,9 +1008,12 @@ class RecallQueryPlan:
     allow_caution_diffusion: bool
     specific_terms: tuple[str, ...]
     locatable_terms: tuple[str, ...]
+    entity_anchor_terms: tuple[str, ...]
     activated_axis_terms: tuple[str, ...]
     activated_axis_groups: tuple[tuple[str, ...], ...]
     activated_axis_multi: bool
+    excluded_axis_terms: tuple[str, ...]
+    axis_polarity_debug: dict[str, Any]
     auto_too_vague: bool
     short_taste_terms: tuple[str, ...]
     long_term_route: str
@@ -1037,11 +1064,25 @@ ANCHOR_WEAK_EVENT_TERMS = {
     "那次",
     "什么",
 }
+ANCHOR_TERM_VARIANT_FAMILIES = (
+    ("累", "疲惫", "疲劳", "消耗", "耗尽", "精疲力尽", "tired"),
+    ("难过", "伤心", "低落", "沮丧", "失落", "sad", "upset"),
+    ("焦虑", "紧张", "担心", "担忧", "不安", "anxious"),
+    ("烦", "烦躁", "生气", "愤怒", "angry"),
+    ("害怕", "恐惧", "怕"),
+    ("孤独", "寂寞", "lonely"),
+)
 ANCHOR_TERM_VARIANTS = {
-    "担心": ("担心", "担忧", "怕", "害怕"),
-    "担忧": ("担忧", "担心", "怕", "害怕"),
-    "忘记": ("忘记", "忘", "遗忘", "记忆丢失", "记忆断掉"),
+    term: family
+    for family in ANCHOR_TERM_VARIANT_FAMILIES
+    for term in family
 }
+ANCHOR_TERM_VARIANTS.update(
+    {
+        "忘记": ("忘记", "忘", "遗忘", "记忆丢失", "记忆断掉"),
+        "忘": ("忘", "忘记", "遗忘", "记忆丢失", "记忆断掉"),
+    }
+)
 ANCHOR_OPTIONAL_WEAK_TERMS = frozenset({"喜欢"})
 
 
@@ -1359,7 +1400,17 @@ class RecallPolicy:
         explicit_old_memory = self._query_explicitly_requests_old_memory(text)
         allow_caution_diffusion = explicit_old_memory or str(context_mode or "").strip() in CAUTION_CONTEXT_MODES
         locatable_terms = tuple(self.locatable_query_terms(text))
-        axis_terms, axis_groups, axis_multi = self._activated_axis_from_locatable_terms(text, locatable_terms)
+        entity_anchor_terms = tuple(
+            self.entity_anchor_terms(text, locatable_terms=locatable_terms)
+        )
+        axis_locatable_terms, excluded_axis_terms, axis_polarity_debug = self._axis_polarity_terms(
+            text,
+            locatable_terms,
+        )
+        axis_terms, axis_groups, axis_multi = self._activated_axis_from_locatable_terms(
+            text,
+            axis_locatable_terms,
+        )
         skip_long_term_recall, skip_reason = self._long_term_skip_decision(
             text,
             locatable_terms=locatable_terms,
@@ -1377,15 +1428,94 @@ class RecallPolicy:
             allow_caution_diffusion=allow_caution_diffusion,
             specific_terms=tuple(self.specific_query_terms(text)),
             locatable_terms=locatable_terms,
+            entity_anchor_terms=entity_anchor_terms,
             activated_axis_terms=axis_terms,
             activated_axis_groups=axis_groups,
             activated_axis_multi=axis_multi,
+            excluded_axis_terms=excluded_axis_terms,
+            axis_polarity_debug=axis_polarity_debug,
             auto_too_vague=self.is_auto_query_too_vague(text),
             short_taste_terms=tuple(self._short_taste_query_terms(text)),
             long_term_route="skip" if skip_long_term_recall else "search",
             skip_long_term_recall=skip_long_term_recall,
             skip_reason=skip_reason,
         )
+
+    def _axis_polarity_terms(
+        self,
+        query: str,
+        locatable_terms: tuple[str, ...],
+    ) -> tuple[tuple[str, ...], tuple[str, ...], dict[str, Any]]:
+        compact_query = self._compact_entity_keyword(query)
+        if not compact_query or not locatable_terms:
+            return tuple(locatable_terms), (), {
+                "contrast_detected": False,
+                "excluded_terms": [],
+                "retained_terms": list(locatable_terms),
+            }
+
+        excluded: list[str] = []
+        retained: list[str] = []
+        for term in locatable_terms:
+            cleaned = str(term or "").strip()
+            key = self._compact_entity_keyword(cleaned)
+            if key and self._axis_term_only_negated(compact_query, key):
+                excluded.append(cleaned)
+            else:
+                retained.append(cleaned)
+
+        contrast_detected = any(marker in compact_query for marker in AXIS_CONTRAST_MARKERS)
+        return tuple(retained), tuple(excluded), {
+            "contrast_detected": contrast_detected,
+            "excluded_terms": list(excluded),
+            "retained_terms": list(retained),
+            "rule": "negated_terms_are_not_required_axes",
+        }
+
+    def _axis_term_only_negated(self, compact_query: str, term_key: str) -> bool:
+        occurrences: list[tuple[int, int]] = []
+        start = 0
+        while True:
+            index = compact_query.find(term_key, start)
+            if index < 0:
+                break
+            occurrences.append((index, index + len(term_key)))
+            start = index + max(1, len(term_key))
+        if not occurrences:
+            return False
+        return all(
+            self._axis_occurrence_is_negated(compact_query, start, end)
+            for start, end in occurrences
+        )
+
+    def _axis_occurrence_is_negated(self, compact_query: str, start: int, end: int) -> bool:
+        left_start = max(0, start - AXIS_NEGATION_LOOKBEHIND)
+        left = compact_query[left_start:start]
+        right = compact_query[end:end + AXIS_NEGATION_LOOKAHEAD]
+
+        for marker in AXIS_CONTRAST_MARKERS:
+            marker_index = left.rfind(marker)
+            if marker_index >= 0:
+                left = left[marker_index + len(marker):]
+        nearest_right_contrast = min(
+            (index for marker in AXIS_CONTRAST_MARKERS if (index := right.find(marker)) >= 0),
+            default=-1,
+        )
+        if nearest_right_contrast >= 0:
+            right = right[:nearest_right_contrast]
+
+        for marker in AXIS_NEGATION_MARKERS:
+            if left.endswith(marker):
+                if marker == "不是" and left.endswith("是不是"):
+                    continue
+                return True
+            marker_index = right.find(marker)
+            if marker_index < 0:
+                continue
+            if marker == "不是" and marker_index > 0 and right[marker_index - 1] == "是":
+                continue
+            return True
+        return False
 
     def _activated_axis_from_locatable_terms(
         self,
@@ -1623,6 +1753,15 @@ class RecallPolicy:
         if query_has_facet(query, "old_or_resolved", self.options):
             return True
         text = " ".join(str(query or "").lower().split())
+        future_instruction = bool(re.search(
+            r"(?:记得|别忘了|不要忘了).*(?:明天|后天|今晚|待会|等会|稍后|之后|下次|到时候|提醒|设置|安排|再做|再去|要做|要去)",
+            text,
+        ))
+        if not future_instruction and re.search(
+            r"(?:还记得|记不记得|(?:你|你还|还)?记得(?:吗|嘛|么|不)?|想起|想起来|回忆)",
+            text,
+        ):
+            return True
         return any(marker in text for marker in OLD_OR_RESOLVED_QUERY_MARKERS)
 
     def is_auto_query_too_vague(self, query: str) -> bool:
@@ -2372,6 +2511,40 @@ class RecallPolicy:
             add(term, force=True)
 
         return tuple(output[:8])
+
+    def entity_anchor_terms(
+        self,
+        query: str,
+        *,
+        locatable_terms: tuple[str, ...] | list[str] | None = None,
+    ) -> list[str]:
+        raw = str(query or "").strip()
+        if not raw:
+            return []
+        terms = list(locatable_terms) if locatable_terms is not None else self.locatable_query_terms(raw)
+        by_key = {
+            self._compact_entity_keyword(term): str(term).strip()
+            for term in terms
+            if str(term).strip() and self._compact_entity_keyword(term)
+        }
+        if not by_key:
+            return []
+        output: list[str] = []
+        seen: set[str] = set()
+        for word, flag in self._posseg_words(raw):
+            flag_text = str(flag or "")
+            if not (
+                flag_text in ENTITY_KEYWORD_POS_TAGS
+                or any(flag_text.startswith(prefix) for prefix in ENTITY_KEYWORD_POS_PREFIXES)
+            ):
+                continue
+            normalized = self._normalize_locatable_query_term(word)
+            key = self._compact_entity_keyword(normalized)
+            if not key or key not in by_key or key in seen:
+                continue
+            seen.add(key)
+            output.append(by_key[key])
+        return output
 
     def _pos_structural_locatable_terms(
         self,

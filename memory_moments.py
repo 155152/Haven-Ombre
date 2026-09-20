@@ -9,6 +9,8 @@ import unicodedata
 from datetime import datetime, timezone
 from typing import Any
 
+import numpy as np
+
 from favorite_tags import favorite_policy_tags
 from memory_relevance import (
     MemoryRelevanceOptions,
@@ -19,6 +21,9 @@ from memory_relevance import (
 )
 from query_terms import GENERIC_LEXICAL_STOPWORDS
 from utils import strip_wikilinks
+
+
+ASSOCIATIVE_TRIGGER_SOURCE_VERSION = "v2-retrospective-bridge"
 
 
 SECTION_ALIASES = {
@@ -190,6 +195,7 @@ class MemoryMomentStore:
         )
         self.db_path = os.path.join(state_dir, "memory_moments.sqlite")
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+        self._associative_trigger_cache: dict[str, tuple[list[dict], np.ndarray | None]] = {}
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
@@ -265,6 +271,42 @@ class MemoryMomentStore:
             ON memory_retrieval_aliases(bucket_id)
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS memory_associative_triggers (
+                bucket_id TEXT NOT NULL,
+                trigger_id TEXT NOT NULL,
+                trigger_type TEXT NOT NULL CHECK(trigger_type IN ('bridge', 'horizon')),
+                channel TEXT NOT NULL DEFAULT '',
+                trigger_text TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                source_hash TEXT NOT NULL,
+                embedding_json TEXT NOT NULL,
+                embedding_model TEXT NOT NULL DEFAULT '',
+                embedding_dimension INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(bucket_id, trigger_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_memory_associative_triggers_bucket
+            ON memory_associative_triggers(bucket_id)
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS memory_associative_trigger_state (
+                bucket_id TEXT PRIMARY KEY,
+                source_hash TEXT NOT NULL,
+                embedding_model TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL CHECK(status IN ('ready', 'empty', 'pending')),
+                trigger_count INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
         conn.commit()
         conn.close()
 
@@ -337,6 +379,251 @@ class MemoryMomentStore:
         ).fetchall()
         conn.close()
         return [dict(row) for row in rows]
+
+    def has_associative_triggers(self) -> bool:
+        conn = self._connect()
+        try:
+            row = conn.execute("SELECT 1 FROM memory_associative_triggers LIMIT 1").fetchone()
+        finally:
+            conn.close()
+        return row is not None
+
+    def get_associative_trigger_state(self, bucket_id: str) -> dict:
+        bucket_id = str(bucket_id or "").strip()
+        if not bucket_id:
+            return {}
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT * FROM memory_associative_trigger_state WHERE bucket_id = ?",
+                (bucket_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        return dict(row) if row else {}
+
+    def list_associative_triggers(self, bucket_id: str) -> list[dict]:
+        bucket_id = str(bucket_id or "").strip()
+        if not bucket_id:
+            return []
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """
+                SELECT bucket_id, trigger_id, trigger_type, channel, trigger_text, confidence,
+                       source_hash, embedding_model, embedding_dimension, updated_at
+                FROM memory_associative_triggers
+                WHERE bucket_id = ?
+                ORDER BY trigger_type ASC, channel ASC, trigger_id ASC
+                """,
+                (bucket_id,),
+            ).fetchall()
+        finally:
+            conn.close()
+        return [dict(row) for row in rows]
+
+    def replace_associative_triggers(
+        self,
+        bucket_id: str,
+        source_hash: str,
+        triggers: list[dict],
+        *,
+        embedding_model: str = "",
+        status: str = "ready",
+    ) -> int:
+        bucket_id = str(bucket_id or "").strip()
+        source_hash = str(source_hash or "").strip()
+        if not bucket_id or not source_hash:
+            return 0
+        state_status = str(status or "ready").strip().lower()
+        if state_status not in {"ready", "empty", "pending"}:
+            state_status = "ready"
+        model_hint = str(embedding_model or "").strip()[:160]
+        conn = self._connect()
+        try:
+            conn.execute("DELETE FROM memory_associative_triggers WHERE bucket_id = ?", (bucket_id,))
+            written = 0
+            now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            for index, raw in enumerate(triggers or []):
+                if not isinstance(raw, dict):
+                    continue
+                trigger_type = str(raw.get("trigger_type") or raw.get("type") or "").strip().lower()
+                if trigger_type not in {"bridge", "horizon"}:
+                    continue
+                trigger_text = re.sub(r"\s+", " ", str(raw.get("trigger_text") or raw.get("text") or "").strip())
+                if len(trigger_text) < 4 or len(trigger_text) > 240:
+                    continue
+                try:
+                    confidence = max(0.0, min(1.0, float(raw.get("confidence", 0.0))))
+                except (TypeError, ValueError):
+                    confidence = 0.0
+                if confidence <= 0:
+                    continue
+                embedding = raw.get("embedding")
+                if not isinstance(embedding, list) or not embedding:
+                    continue
+                try:
+                    vector = [float(value) for value in embedding]
+                except (TypeError, ValueError):
+                    continue
+                if not vector or not all(np.isfinite(value) for value in vector):
+                    continue
+                trigger_id = str(raw.get("trigger_id") or "").strip() or f"{trigger_type}:{index}:{_sha1(trigger_text)[:12]}"
+                channel = str(raw.get("channel") or "").strip().lower()[:64]
+                model = str(raw.get("embedding_model") or model_hint or "").strip()[:160]
+                if not model_hint and model:
+                    model_hint = model
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO memory_associative_triggers
+                    (bucket_id, trigger_id, trigger_type, channel, trigger_text, confidence,
+                     source_hash, embedding_json, embedding_model, embedding_dimension, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        bucket_id,
+                        trigger_id,
+                        trigger_type,
+                        channel,
+                        trigger_text,
+                        confidence,
+                        source_hash,
+                        json.dumps(vector, ensure_ascii=False),
+                        model,
+                        len(vector),
+                        now,
+                    ),
+                )
+                written += 1
+            if state_status == "ready" and written <= 0:
+                state_status = "empty"
+            conn.execute(
+                """
+                INSERT INTO memory_associative_trigger_state
+                (bucket_id, source_hash, embedding_model, status, trigger_count, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(bucket_id) DO UPDATE SET
+                    source_hash = excluded.source_hash,
+                    embedding_model = excluded.embedding_model,
+                    status = excluded.status,
+                    trigger_count = excluded.trigger_count,
+                    updated_at = excluded.updated_at
+                """,
+                (bucket_id, source_hash, model_hint, state_status, written, now),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        self._invalidate_associative_trigger_cache()
+        return written
+
+    def search_associative_triggers(
+        self,
+        query_embedding: list[float],
+        *,
+        eligible_bucket_ids: set[str] | None = None,
+        embedding_model: str = "",
+        top_k: int = 12,
+        min_cosine: float = 0.82,
+    ) -> list[dict]:
+        if not isinstance(query_embedding, list) or not query_embedding:
+            return []
+        try:
+            query = np.asarray(query_embedding, dtype=np.float32)
+        except (TypeError, ValueError):
+            return []
+        if query.ndim != 1 or query.size == 0:
+            return []
+        norm = float(np.linalg.norm(query))
+        if norm <= 0:
+            return []
+        rows, matrix = self._associative_trigger_index(embedding_model=embedding_model)
+        if matrix is None or matrix.size == 0 or matrix.shape[1] != query.shape[0]:
+            return []
+        query = query / norm
+        scores = matrix @ query
+        eligible = {str(value) for value in (eligible_bucket_ids or set()) if str(value)}
+        results: list[dict] = []
+        gate = max(0.0, min(1.0, float(min_cosine)))
+        for index in np.argsort(scores)[::-1]:
+            score = float(scores[int(index)])
+            if score < gate:
+                break
+            row = rows[int(index)]
+            if eligible and str(row.get("bucket_id") or "") not in eligible:
+                continue
+            item = dict(row)
+            item["score"] = round(score, 4)
+            item.pop("embedding_json", None)
+            results.append(item)
+            if len(results) >= max(1, int(top_k)):
+                break
+        return results
+
+    def associative_source_hash(self, bucket: dict) -> str:
+        if not isinstance(bucket, dict):
+            return ""
+        moments = parse_bucket_moments(bucket, self.relevance_options, self.annotation_options)
+        return _associative_source_hash_from_parts(_bucket_title(bucket), moments)
+
+    def _invalidate_associative_trigger_cache(self) -> None:
+        self._associative_trigger_cache.clear()
+
+    def _associative_trigger_index(self, *, embedding_model: str = "") -> tuple[list[dict], np.ndarray | None]:
+        model_key = str(embedding_model or "").strip()
+        cached = self._associative_trigger_cache.get(model_key)
+        if cached is not None:
+            return cached
+        conn = self._connect()
+        try:
+            version_prefix = f"{ASSOCIATIVE_TRIGGER_SOURCE_VERSION}:%"
+            if model_key:
+                raw_rows = conn.execute(
+                    """
+                    SELECT bucket_id, trigger_id, trigger_type, channel, trigger_text, confidence,
+                           source_hash, embedding_json, embedding_model, embedding_dimension, updated_at
+                    FROM memory_associative_triggers
+                    WHERE embedding_model = ? AND source_hash LIKE ?
+                    ORDER BY bucket_id ASC, trigger_id ASC
+                    """,
+                    (model_key, version_prefix),
+                ).fetchall()
+            else:
+                raw_rows = conn.execute(
+                    """
+                    SELECT bucket_id, trigger_id, trigger_type, channel, trigger_text, confidence,
+                           source_hash, embedding_json, embedding_model, embedding_dimension, updated_at
+                    FROM memory_associative_triggers
+                    WHERE source_hash LIKE ?
+                    ORDER BY bucket_id ASC, trigger_id ASC
+                    """,
+                    (version_prefix,),
+                ).fetchall()
+        finally:
+            conn.close()
+        rows: list[dict] = []
+        vectors: list[np.ndarray] = []
+        expected_dimension: int | None = None
+        for raw in raw_rows:
+            item = dict(raw)
+            try:
+                vector = np.asarray(json.loads(item.get("embedding_json") or "[]"), dtype=np.float32)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue
+            if vector.ndim != 1 or vector.size == 0:
+                continue
+            if expected_dimension is None:
+                expected_dimension = int(vector.size)
+            if int(vector.size) != expected_dimension:
+                continue
+            norm = float(np.linalg.norm(vector))
+            if norm <= 0:
+                continue
+            rows.append(item)
+            vectors.append(vector / norm)
+        matrix = np.stack(vectors, axis=0) if vectors else None
+        self._associative_trigger_cache[model_key] = (rows, matrix)
+        return rows, matrix
 
     def get(self, moment_id: str) -> dict | None:
         moment_id = str(moment_id or "").strip()
@@ -449,16 +736,23 @@ class MemoryMomentStore:
             "DELETE FROM memory_retrieval_aliases WHERE bucket_id = ?",
             (bucket_id,),
         )
+        trigger_cursor = conn.execute(
+            "DELETE FROM memory_associative_triggers WHERE bucket_id = ?",
+            (bucket_id,),
+        )
+        conn.execute("DELETE FROM memory_associative_trigger_state WHERE bucket_id = ?", (bucket_id,))
         conn.commit()
         conn.close()
+        self._invalidate_associative_trigger_cache()
         return {
             "moments": max(0, int(moment_cursor.rowcount or 0)),
             "edges": max(0, int(edge_cursor.rowcount or 0)),
             "aliases": max(0, int(alias_cursor.rowcount or 0)),
+            "associative_triggers": max(0, int(trigger_cursor.rowcount or 0)),
         }
 
     def search_retrieval_aliases(self, query: str, limit: int = 20) -> list[dict]:
-        query_terms = _retrieval_alias_query_terms(query)
+        query_terms = _retrieval_alias_query_terms(query, self.relevance_options)
         if not query_terms:
             return []
 
@@ -484,6 +778,17 @@ class MemoryMomentStore:
             params,
         ).fetchall()
         conn.close()
+
+        term_bucket_ids: dict[str, set[str]] = {key: set() for _, key in query_terms}
+        for row in rows:
+            alias_key = str(row["alias_key"] or "")
+            bucket_id = str(row["bucket_id"] or "")
+            if not alias_key or not bucket_id:
+                continue
+            for _, key in query_terms:
+                if key in alias_key or alias_key in key:
+                    term_bucket_ids[key].add(bucket_id)
+        term_bucket_counts = {key: len(bucket_ids) for key, bucket_ids in term_bucket_ids.items()}
 
         results = []
         for row in rows:
@@ -518,11 +823,16 @@ class MemoryMomentStore:
                     "bucket_count": int(alias["bucket_count"] or 0),
                     "score": round(score, 4),
                     "matched_terms": matched_terms,
+                    "matched_term_bucket_count": min(
+                        (term_bucket_counts.get(key, 0) for key in matched_keys if term_bucket_counts.get(key, 0) > 0),
+                        default=10**9,
+                    ),
                 }
             )
 
         results.sort(
             key=lambda item: (
+                int(item["matched_term_bucket_count"]),
                 -float(item["score"]),
                 int(item["bucket_count"]),
                 0 if item["source"] == "title" else 1,
@@ -648,6 +958,16 @@ class MemoryMomentStore:
     ) -> None:
         conn.execute("DELETE FROM memory_moments WHERE bucket_id = ?", (bucket_id,))
         conn.execute("DELETE FROM memory_retrieval_aliases WHERE bucket_id = ?", (bucket_id,))
+        source_hash = _associative_source_hash_from_parts(bucket_title, moments)
+        conn.execute(
+            "DELETE FROM memory_associative_triggers WHERE bucket_id = ? AND source_hash <> ?",
+            (bucket_id, source_hash),
+        )
+        conn.execute(
+            "DELETE FROM memory_associative_trigger_state WHERE bucket_id = ? AND source_hash <> ?",
+            (bucket_id, source_hash),
+        )
+        self._invalidate_associative_trigger_cache()
         conn.execute(
             """
             DELETE FROM memory_moment_edges
@@ -720,6 +1040,16 @@ class MemoryMomentStore:
             metadata = {}
         moment["metadata"] = metadata if isinstance(metadata, dict) else {}
         return moment
+
+
+def _associative_source_hash_from_parts(bucket_title: str, moments: list[dict]) -> str:
+    parts = [re.sub(r"\s+", " ", str(bucket_title or "").strip())]
+    parts.extend(
+        re.sub(r"\s+", " ", str(moment.get("text") or "").strip())
+        for moment in (moments or [])
+        if str(moment.get("text") or "").strip()
+    )
+    return f"{ASSOCIATIVE_TRIGGER_SOURCE_VERSION}:{_sha1(chr(10).join(parts))}"
 
 
 def _build_retrieval_aliases(
@@ -911,11 +1241,15 @@ def _retrieval_alias_is_identifier(value: str) -> bool:
     )
 
 
-def _retrieval_alias_query_terms(query: Any) -> list[tuple[str, str]]:
+def _retrieval_alias_query_terms(
+    query: Any,
+    relevance_options: MemoryRelevanceOptions | None = None,
+) -> list[tuple[str, str]]:
     cleaned = _clean_retrieval_alias_text(query)
     if not cleaned:
         return []
     candidates = _retrieval_alias_variants(cleaned)
+    candidates.extend(content_terms_for_query(cleaned, relevance_options))
     candidates.extend(
         part
         for part in re.split(r"[\s,\uff0c\u3002\uff01\uff1f!?;\uff1b:\uff1a/\\|]+", cleaned)
